@@ -1,0 +1,38 @@
+# Web 框架
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# LangChain 生态
+langchain>=1.0
+langchain-openai>=1.0
+langchain-community>=0.4
+langchain-chroma>=0.2
+langchain-text-splitters>=1.0
+
+# 向量库（第 2 周迁移到 PGvector 后移除 chromadb）
+# 版本下限放开，交给 pip 与 langchain-chroma 协商兼容版本
+chromadb>=0.5.2
+
+# Embedding（本地 BGE，ONNX Runtime，无 torch 依赖）
+fastembed>=0.7
+
+# 配置
+pydantic>=2.7
+pydantic-settings>=2.6
+python-dotenv>=1.0
+
+# 文档解析
+pypdf>=5.0
+
+# 混合检索（v0.2）：中文分词 + BM25 关键词检索
+jieba>=0.42
+rank-bm25>=0.2
+
+# 存储升级（v0.3）：PostgreSQL + pgvector + 连接池 + Redis 缓存
+psycopg[binary,pool]>=3.2
+pgvector>=0.3
+redis>=5.0
+
+# 监控（v0.5）：Prometheus 指标暴露（/metrics 端点）
+prometheus-client>=0.20
