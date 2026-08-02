@@ -18,18 +18,24 @@ from fastembed import TextEmbedding
 
 from app.config import settings
 from app.core.cache import Cache, get_cache
+from app.core.metrics import CACHE_HITS, CACHE_MISSES
 
 EMB_TTL = 7 * 24 * 3600  # Embedding 结果稳定，缓存 7 天
 
 
 class BGEEmbeddings:
     def __init__(self) -> None:
-        # fastembed 首次调用会自动下载模型到本地缓存（~95MB）
-        self._model = TextEmbedding(model_name=settings.embed_model)
+        # fastembed 首次调用会自动下载模型到本地缓存（~95MB）；
+        # threads 显式限制单条推理线程数，避免并发时吃满全核互相阻塞（压测结论）
+        self._model = TextEmbedding(model_name=settings.embed_model, threads=settings.onnx_threads)
         self._cache = get_cache()
 
     def _lookup(self, key: str):
         hit = self._cache.get_json(key)
+        if not hit:
+            CACHE_MISSES.labels(kind="embed").inc()
+            return None
+        CACHE_HITS.labels(kind="embed").inc()
         return hit["v"] if hit else None
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
