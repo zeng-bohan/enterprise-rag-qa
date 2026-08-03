@@ -17,6 +17,8 @@ from typing import List, Optional, Tuple
 from langchain_core.documents import Document
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 
+from app.config import settings
+
 RERANK_MODEL = "BAAI/bge-reranker-base"
 
 
@@ -28,7 +30,10 @@ class CrossEncoderReranker:
     def __init__(self) -> None:
         self._model: Optional[TextCrossEncoder] = None
         try:
-            self._model = TextCrossEncoder(model_name=RERANK_MODEL)
+            # threads 限单条推理线程数：默认全核会让并发重排互相抢核（压测结论）
+            self._model = TextCrossEncoder(
+                model_name=RERANK_MODEL, threads=settings.onnx_threads
+            )
         except Exception:
             self._model = None
 
