@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     # ---- Embedding（本地 BGE，fastembed / ONNX Runtime）----
     embed_model: str = "BAAI/bge-small-zh-v1.5"
     embed_dim: int = 512
+    # 单条 ONNX 推理线程数。压测实测（i5-14400F，6P+4E）：
+    # 默认（全核）单条推理吃满 CPU，并发请求零加速；显式限线程 + 专用有界线程池
+    # （app/core/executor.py）后并发可叠加。4 是单请求延迟与吞吐的平衡点
+    # （实测表见 docs/DESIGN.md 第 12 节）。
+    onnx_threads: int = 4
 
     # ---- 向量库 ----
     # 后端切换：pgvector（生产，docker compose） / chroma（零依赖本地）
