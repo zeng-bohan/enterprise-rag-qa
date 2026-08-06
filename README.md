@@ -1,8 +1,21 @@
 # 企业知识库 RAG 问答系统
 
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
+![PGvector](https://img.shields.io/badge/PGvector-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-DC382D?style=flat-square&logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=flat-square&logo=prometheus&logoColor=white)
+![RAGAs](https://img.shields.io/badge/RAGAs-4B8BBE?style=flat-square)
+
+![Recall@1](https://img.shields.io/badge/Recall%401-87.4%25-4C9F70?style=flat-square)
+![Faithfulness](https://img.shields.io/badge/Faithfulness-94.1%25-4C9F70?style=flat-square)
+![P95](https://img.shields.io/badge/P95_32s%20%E2%86%92%2010s-FF6F00?style=flat-square)
+
 基于大模型（DeepSeek）的企业级知识库问答系统：文档解析 → 语义切片 → 向量化入库 → 混合检索 → 引用溯源生成，支持无答案拒答与评测流水线。
 
-> 当前版本：v0.4（评测）。Roadmap 见文末。
+> 当前版本：v0.5（异步并发 + Prometheus 监控）。Roadmap 见文末。
 
 ## 架构
 
