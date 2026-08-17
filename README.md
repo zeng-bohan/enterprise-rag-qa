@@ -1,4 +1,4 @@
-# 企业知识库 RAG 问答系统
+# 企业知识库 RAG 问答系统 · Enterprise Knowledge-base RAG Q&A
 
 ![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
@@ -12,6 +12,8 @@
 ![Recall@1](https://img.shields.io/badge/Recall%401-87.4%25-4C9F70?style=flat-square)
 ![Faithfulness](https://img.shields.io/badge/Faithfulness-94.1%25-4C9F70?style=flat-square)
 ![P95](https://img.shields.io/badge/P95_32s%20%E2%86%92%2010s-FF6F00?style=flat-square)
+
+> **Enterprise Knowledge-base RAG Q&A** — document parsing, hybrid retrieval (BM25 + vector), Cross-Encoder reranking and citation-grounded generation. Built with FastAPI · LangChain · PGvector · Redis. Measured: Recall@1 **87.4%** · Faithfulness **94.1%** · P95 **32s → 10s**.
 
 基于大模型（DeepSeek）的企业级知识库问答系统：文档解析 → 语义切片 → 向量化入库 → 混合检索 → 引用溯源生成，支持无答案拒答与评测流水线。
 
@@ -104,3 +106,7 @@ app/
 - [x] v0.3 存储升级：PGvector + Redis 语义缓存 + Docker Compose 一键部署
 - [x] v0.4 评测：334 条 QA 评测集 + Recall@k 实测（Recall@1 66.2% → 87.4%）+ RAGAs 实测（100 条抽样：Faithfulness 94.1% / Answer Relevance 88.7%，幻觉率 5.9%）
 - [x] v0.5 性能：异步并发（LLM 全链路 ainvoke + CPU 专用有界线程池）+ Prometheus 指标；压测 P95 32s → 10s（详见 docs/DESIGN.md 第 12 节）
+
+## 许可
+
+MIT
