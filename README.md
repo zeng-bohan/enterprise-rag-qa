@@ -1,5 +1,13 @@
 # 企业知识库 RAG 问答系统 · Enterprise Knowledge-base RAG Q&A
 
+
+![Banner](docs/banner.svg)
+
+> Enterprise knowledge-base RAG Q&A with document parsing, hybrid BM25+vector retrieval, Cross-Encoder reranking and citation-grounded generation.
+
+**Topics:** `rag` · `llm` · `enterprise` · `hybrid-search` · `pgvector` · `ragas` · `deepseek`
+
+
 ![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?style=flat-square&logo=langchain&logoColor=white)
@@ -110,3 +118,25 @@ app/
 ## 许可
 
 MIT
+
+---
+
+## 🤝 贡献
+
+```bash
+git clone https://github.com/zengbohan1/enterprise-rag-qa
+cd enterprise-rag-qa
+python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
+cp .env.example .env
+docker-compose up -d
+pytest
+```
+
+## 📜 License
+
+[MIT](LICENSE)
+
+## 🙏 致谢
+
+- LangChain RAG 评测模块（RAGAs）的参考实现
+- BGE embedding 模型的开源贡献
