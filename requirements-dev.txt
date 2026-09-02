@@ -1,0 +1,4 @@
+# 测试与开发依赖（运行时依赖见 requirements.txt）
+# 整套测试离线运行：不依赖 PostgreSQL / Redis，不下载任何模型
+pytest>=8.0
+httpx>=0.27  # FastAPI TestClient

@@ -8,6 +8,8 @@ An enterprise RAG service for document-grounded question answering. It combines 
 ![Recall@1](https://img.shields.io/badge/Recall%401-87.4%25-4C9F70?style=flat-square)
 ![Faithfulness](https://img.shields.io/badge/Faithfulness-94.1%25-4C9F70?style=flat-square)
 ![P95](https://img.shields.io/badge/P95-32s%20to%2010s-FF6F00?style=flat-square)
+[![CI](https://github.com/zengbohan1/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zengbohan1/enterprise-rag-qa/actions/workflows/ci.yml)
+![Tests](https://img.shields.io/badge/Tests-60%20passed-4C9F70?style=flat-square)
 
 ## Capabilities
 
@@ -94,27 +96,54 @@ Open `http://127.0.0.1:8000/docs` for the interactive API documentation.
 ```text
 app/
 ├── main.py            # FastAPI application
-├── config.py          # environment configuration
+├── config.py          # environment configuration (.env, pydantic-settings)
+├── schemas.py         # request/response models
 ├── api/chat.py        # /v1/chat endpoint
 ├── core/
-│   ├── llm.py         # DeepSeek client
-│   └── embeddings.py  # local BGE embeddings
+│   ├── llm.py         # DeepSeek client (OpenAI-compatible)
+│   ├── embeddings.py  # local BGE embeddings (fastembed/ONNX) with caching
+│   ├── cache.py       # Redis cache with graceful degradation
+│   ├── executor.py    # bounded thread pool for CPU-bound work
+│   └── metrics.py     # Prometheus metrics
 └── rag/
-    ├── document_loader.py
-    ├── chunker.py
-    ├── vector_store.py
-    ├── retriever.py
-    ├── generator.py
-    └── pipeline.py
+    ├── document_loader.py  # PDF / Markdown / TXT parsing
+    ├── chunker.py          # Chinese-aware semantic chunking
+    ├── query_rewriter.py   # LLM query rewrite for BM25 recall
+    ├── bm25_index.py       # jieba + BM25Okapi keyword index
+    ├── vector_store.py     # PGvector / Chroma backends behind one interface
+    ├── retriever.py        # hybrid recall + RRF fusion + reranking + refusal
+    ├── reranker.py         # Cross-Encoder reranking (fastembed)
+    ├── generator.py        # citation-grounded generation, refusal, semantic cache
+    └── pipeline.py         # orchestration + per-stage timings
 scripts/
-├── ingest_docs.py
-└── ask.py
+├── ingest_docs.py      # build the index from data/docs
+├── ask.py              # CLI question
+├── fetch_corpus.py     # fetch source documents
+├── gen_qa_set.py       # generate the chunk-grounded QA eval set
+├── eval_recall.py      # Recall@1/3/5 (hybrid vs vector-only baseline)
+├── eval_ragas.py       # RAGAS faithfulness / relevancy
+└── bench.py            # latency benchmark
+tests/                  # 60 offline tests (no PG / Redis / model downloads)
+data/qa_set/            # QA eval set and metric reports
 docker-compose.yml
 ```
 
-## Validation status
+## Tests & evaluation
 
-The repository currently contains the runnable application and ingestion scripts. Its `tests/` directory is only a placeholder, so the documented validation path is the ingestion command, CLI query, and `/docs` API flow above rather than a claimed test suite.
+**Unit / integration tests — fully offline.** The suite stubs the LLM, Cross-Encoder, vector store, and Redis, so it runs without PostgreSQL, Redis, model downloads, or network access:
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests -q        # 60 passed
+```
+
+**Retrieval evaluation.** `scripts/gen_qa_set.py` builds a chunk-grounded QA set (each question is answerable only from a single chunk; 10% human spot-check), and `scripts/eval_recall.py` measures Recall@k for the hybrid retriever against a vector-only baseline:
+
+- Recall@1 **87.4%** / Recall@3 **97.9%** / Recall@5 **98.2%** (n=334, hybrid) — full report in `data/qa_set/recall_report.json`
+
+**Generation quality.** `scripts/eval_ragas.py` scores generated answers with RAGAS:
+
+- Faithfulness **94.1%**, answer relevancy **88.7%**, hallucination rate **5.9%** (n=100) — full report in `data/qa_set/ragas_report.json`
 
 ## License
 
