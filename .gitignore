@@ -7,3 +7,5 @@ data/chroma/
 .DS_Store
 .idea/
 .vscode/
+data/registry.db
+data/uploads/

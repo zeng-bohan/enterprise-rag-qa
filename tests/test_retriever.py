@@ -131,3 +131,28 @@ def test_retrieve_custom_threshold_triggers_prefuse_refusal(monkeypatch):
     retriever, *_ = _build_integration_retriever(monkeypatch, [0.9, 0.6])
     # 向量最高 0.9 < 0.95，BM25 对「量子」无命中 → 前置拒答
     assert retriever.retrieve("量子计算 芯片", threshold=0.95) == []
+
+
+def test_degraded_reranker_keeps_results_instead_of_empty(monkeypatch):
+    """重排器降级（模型加载失败）时应退化为不重排，而不是被 0.5 地板清空结果。"""
+    class UnavailableReranker(FakeReranker):
+        def __init__(self):
+            super().__init__([])
+            self.seen_candidates = 0
+
+        def rerank(self, query, docs):
+            self.seen_candidates = len(docs)
+            return [(d, 0.0) for d in docs]
+
+        @property
+        def available(self):
+            return False
+
+    r = object.__new__(HybridRetriever)
+    r._reranker = UnavailableReranker()
+    docs = [mkdoc(f"文档{i}", source="s.md") for i in range(3)]
+    out = r._finalize(
+        "年假", [(docs[0], 1.0)], [(docs[1], 0.8), (docs[2], 0.7)], k=5, vec_floor=0.35
+    )
+    assert [d.page_content for d, _ in out] == ["文档0", "文档1", "文档2"]  # RRF 序保留
+    assert r._reranker.available is False

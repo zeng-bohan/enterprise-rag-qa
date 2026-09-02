@@ -16,6 +16,9 @@ from langchain_core.documents import Document
 # ---------------------------------------------------------------------------
 from app.rag import pipeline as _pipeline_mod
 
+# 打桩前保留真实类引用：个别测试需要构造真 RAGPipeline（__new__ 跳过依赖装配）
+RealRAGPipeline = _pipeline_mod.RAGPipeline
+
 
 class _StubPipeline:
     """不持任何资源的空壳：真实依赖只能由用例显式注入，误用即 AttributeError。"""
@@ -86,6 +89,10 @@ class FakeReranker:
         self.scores = scores
         self.seen_candidates = 0
 
+    @property
+    def available(self) -> bool:
+        return True
+
     def rerank(self, query: str, docs: List[Document]) -> List[Tuple[Document, float]]:
         self.seen_candidates = len(docs)
         scored = list(zip(docs, self.scores))
@@ -100,10 +107,10 @@ class FakeStore:
         self._docs = docs
         self._hits = hits or []
 
-    def get_all_documents(self) -> List[Document]:
+    def get_all_documents(self, kb_id: Optional[str] = None) -> List[Document]:
         return list(self._docs)
 
-    def search(self, query: str, top_k: Optional[int] = None) -> List[Tuple[Document, float]]:
+    def search(self, query: str, top_k: Optional[int] = None, kb_id: Optional[str] = None) -> List[Tuple[Document, float]]:
         return list(self._hits)[: top_k or 5]
 
 

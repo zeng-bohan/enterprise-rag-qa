@@ -44,7 +44,7 @@ def test_metrics_exposes_prometheus_counters():
 
 
 def test_chat_happy_path(monkeypatch):
-    async def fake_aask(question: str):
+    async def fake_aask(question: str, **kwargs):
         assert question == "年假几天"
         return dict(_OK_RESULT)
 
@@ -59,7 +59,7 @@ def test_chat_happy_path(monkeypatch):
 
 
 def test_chat_refusal_passes_through_grounded_false(monkeypatch):
-    async def fake_aask(question: str):
+    async def fake_aask(question: str, **kwargs):
         return dict(_REFUSAL_RESULT)
 
     monkeypatch.setattr(chat_module.pipeline, "aask", fake_aask, raising=False)
@@ -84,7 +84,7 @@ def test_chat_rejects_missing_field():
 
 
 def test_chat_internal_error_returns_500(monkeypatch):
-    async def boom(question: str):
+    async def boom(question: str, **kwargs):
         raise RuntimeError("下游故障")
 
     monkeypatch.setattr(chat_module.pipeline, "aask", boom, raising=False)

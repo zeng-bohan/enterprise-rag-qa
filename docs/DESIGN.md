@@ -125,3 +125,34 @@
   受限于混合架构 CPU 的 ONNX 并行度（~2×）与 bge-reranker-base 单次 ~0.7s 的推理成本；
 - 下一步（按收益排序）：RTX 4060 GPU 推理（sentence-transformers / onnxruntime-gpu）；
   换更轻量重排模型或缩减重排候选数（需重跑 Recall 评测验证质量不回退）。
+
+## 13. 多知识库注册中心（v0.6）：元数据与内容分层
+
+主流企业知识库产品（Dify / FastGPT / RAGFlow）的三层模型：知识库 → 文档 → chunk。
+chunk 本体（向量 + 文本）在向量库，kb_id / doc_id 血缘**同时写列与 metadata**；
+知识库与文档的元数据（名字、状态、chunk 数、错误信息）在注册中心。
+注册中心与向量库共用 `VECTOR_BACKEND` 开关：pgvector 模式 = 两张 PG 表（与 chunks
+同库同连接池）；chroma 模式 = 标准库 sqlite3 单文件（data/registry.db），本地零依赖
+不引入新服务。文件记录 doc_id 用 uuid 而非内容哈希：同一份文件允许进多个知识库。
+
+## 14. chunk 血缘与删除闭环（v0.6）
+
+删除的完整性靠血缘，不靠遍历：删文档 = `registry.delete_document`（元数据）+
+`store.delete_by_doc`（按 doc_id 一条 SQL / 一个 where 删掉全部 chunk）；删知识库同理。
+BM25 是进程内按 kb 惰性构建的，任何增删后 `retriever.invalidate(kb_id)` 使对应
+索引失效，下次检索自动重建。老库迁移用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`，
+幂等可重跑。
+
+## 15. 流式事件协议（v0.6）
+
+SSE 三类事件固定顺序：`citations`（检索完成，含引用与分数）→ `token`（增量文本，
+可多条）→ `done`（grounded / cached / retrieval_ms / latency_ms）。拒答与缓存命中
+复用同一协议（citations → 单条 token → done），前端零特判；内部错误发 `error` 事件。
+done 里的分阶段耗时延续了 v0.5 的可观测口径，流式不丢指标。
+
+## 16. 多轮对话：condense 改写 + 缓存策略（v0.6）
+
+追问（「那报销比例呢」）无法直接检索——先让 LLM 把「历史 + 追问」改写成独立问题
+（condense），改写结果喂检索，生成 prompt 注入最近 6 轮历史。两处降级：condense
+失败用原问题；多轮请求**完全绕过语义缓存**——缓存键是「问题 + 命中文档集」，不含
+历史，同一问题不同上文语义不同，宁可不缓存也不返回脏答案。

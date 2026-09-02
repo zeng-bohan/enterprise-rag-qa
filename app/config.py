@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     # 余弦相关度阈值：低于该值视为「资料中无依据」，触发无答案拒答
     score_threshold: float = 0.35
 
+    # ---- 多知识库与访问控制（v0.6）----
+    # 脚本入库与单库问答的默认知识库名（不存在时服务启动自动创建）
+    default_kb: str = "default"
+    # 合法 X-API-Key（逗号分隔）；留空 = 关闭鉴权（本地 / 评测场景）
+    api_keys: str = ""
+
     # ---- 服务 ----
     host: str = "127.0.0.1"
     port: int = 8000
