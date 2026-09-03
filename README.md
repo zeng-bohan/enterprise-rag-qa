@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="docs/banner.svg" width="800" alt="Enterprise Knowledge-base RAG Q&A" />
+</p>
+
 # Enterprise Knowledge-base RAG Q&A
+
+> English | [简体中文](README.zh-CN.md)
 
 An enterprise RAG service for document-grounded question answering — multi-knowledge-base management, document lifecycle, hybrid retrieval, streaming answers, and multi-turn chat. Built to the feature bar of mainstream KB products (Dify / FastGPT / RAGFlow), with an evaluation suite instead of marketing numbers.
 
