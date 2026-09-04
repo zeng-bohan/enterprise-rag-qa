@@ -14,7 +14,7 @@
 ![Recall@1](https://img.shields.io/badge/Recall%401-87.4%25-4C9F70?style=flat-square)
 ![Faithfulness](https://img.shields.io/badge/Faithfulness-94.1%25-4C9F70?style=flat-square)
 ![P95](https://img.shields.io/badge/P95-32s%20to%2010s-FF6F00?style=flat-square)
-[![CI](https://github.com/zengbohan1/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zengbohan1/enterprise-rag-qa/actions/workflows/ci.yml)
+[![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
 ![Tests](https://img.shields.io/badge/Tests-89%20passed-4C9F70?style=flat-square)
 
 ## 功能特性
