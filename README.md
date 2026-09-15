@@ -9,13 +9,7 @@
 An enterprise RAG service for document-grounded question answering — multi-knowledge-base management, document lifecycle, hybrid retrieval, streaming answers, and multi-turn chat. Built to the feature bar of mainstream KB products (Dify / FastGPT / RAGFlow), with an evaluation suite instead of marketing numbers.
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=Docker&logoColor=white)
-![Recall@1](https://img.shields.io/badge/Recall%401-87.4%25-4C9F70?style=flat-square)
-![Faithfulness](https://img.shields.io/badge/Faithfulness-94.1%25-4C9F70?style=flat-square)
-![P95](https://img.shields.io/badge/P95-32s%20to%2010s-FF6F00?style=flat-square)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/Tests-89%20passed-4C9F70?style=flat-square)
 
 ## Features
 
