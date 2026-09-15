@@ -9,13 +9,7 @@
 面向文档问答场景的企业级 RAG 服务——多知识库管理、文档生命周期、混合检索、流式回答与多轮对话。功能对标主流知识库产品（Dify / FastGPT / RAGFlow）的能力线，用评测套件说话，不放营销数字。
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=Docker&logoColor=white)
-![Recall@1](https://img.shields.io/badge/Recall%401-87.4%25-4C9F70?style=flat-square)
-![Faithfulness](https://img.shields.io/badge/Faithfulness-94.1%25-4C9F70?style=flat-square)
-![P95](https://img.shields.io/badge/P95-32s%20to%2010s-FF6F00?style=flat-square)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/Tests-89%20passed-4C9F70?style=flat-square)
 
 ## 功能特性
 
