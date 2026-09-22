@@ -11,6 +11,19 @@ An enterprise RAG service for document-grounded question answering — multi-kno
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
+![Tests](https://img.shields.io/badge/tests-89%20passing%20offline-2EA043?style=flat-square)
+
+## Results at a glance
+
+Measured with the bundled evaluation suite — methodology and full reports in [Tests & evaluation](#tests--evaluation).
+
+| Metric | Result |
+| --- | --- |
+| Recall@1 / Recall@3 / Recall@5 (n=334, hybrid) | **87.4%** / **97.9%** / **98.2%** |
+| Faithfulness (RAGAS, n=100) | **94.1%** |
+| Answer relevancy (RAGAS) | **88.7%** |
+| Hallucination rate (RAGAS) | **5.9%** |
+| P95 latency (after the async pipeline work) | 32s → **10s** |
 
 ## Features
 
@@ -39,20 +52,24 @@ An enterprise RAG service for document-grounded question answering — multi-kno
 
 ## Architecture
 
-```text
-                        ┌────────────────────────────────────────────┐
-  upload (multipart) ──►│ Management API  /v1/kbs, /v1/kbs/{id}/docs │──► KBRegistry (PG tables / SQLite)
-                        └───────────────┬────────────────────────────┘      │ metadata: KB, document, status
-                                        │ chunks (kb_id, doc_id lineage)    ▼
-                                        ▼                        Vector store (PGvector / Chroma)
-  question ──► /v1/chat ──────► RAGPipeline
-               /v1/chat/stream ──►   1. condense (multi-turn) → query rewrite (LLM)
-                                     2. BM25 (per-KB) + vector recall, filtered by kb_id
-                                     3. reciprocal rank fusion → Cross-Encoder rerank
-                                     4. refusal floor / evidence threshold
-                                     5. DeepSeek generation with citations
-                                        ├─ JSON: answer + citations + timings
-                                        └─ SSE:  citations → token* → done
+```mermaid
+flowchart LR
+    subgraph MGMT[Management]
+        U["upload (multipart)"] --> API["Management API<br/>/v1/kbs · /v1/kbs/{id}/docs"]
+        API --> REG["KBRegistry<br/>PG tables / SQLite<br/>metadata: KB, document, status"]
+        API --> VS["Vector store<br/>PGvector / Chroma<br/>chunks (kb_id, doc_id lineage)"]
+    end
+
+    subgraph PIPE[RAGPipeline]
+        Q["question<br/>/v1/chat · /v1/chat/stream"] --> C["1. condense (multi-turn)<br/>query rewrite (LLM)"]
+        C --> R["2. BM25 (per-KB) + vector recall<br/>filtered by kb_id"]
+        R --> F["3. reciprocal rank fusion<br/>→ Cross-Encoder rerank"]
+        F --> RF["4. refusal floor /<br/>evidence threshold"]
+        RF --> G["5. DeepSeek generation<br/>with citations"]
+    end
+
+    G --> J["JSON: answer + citations + timings"]
+    G --> S["SSE: citations → token* → done"]
 ```
 
 ## Quick start
