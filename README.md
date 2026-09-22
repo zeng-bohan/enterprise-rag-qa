@@ -8,6 +8,8 @@
 
 An enterprise RAG service for document-grounded question answering — multi-knowledge-base management, document lifecycle, hybrid retrieval, streaming answers, and multi-turn chat. Built to the feature bar of mainstream KB products (Dify / FastGPT / RAGFlow), with an evaluation suite instead of marketing numbers.
 
+The service is **API-first by design**: every capability ships as a REST endpoint (interactive Swagger at `/docs`, curl recipes below) — there is no web console in v0.6.
+
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
@@ -204,6 +206,10 @@ pytest tests -q        # 89 passed
 **Generation quality.** `scripts/eval_ragas.py` scores generated answers with RAGAS:
 
 - Faithfulness **94.1%**, answer relevancy **88.7%**, hallucination rate **5.9%** (n=100) — full report in `data/qa_set/ragas_report.json`
+
+## Design decisions
+
+The rationale behind every major choice is written up in [docs/DESIGN.md](docs/DESIGN.md) (16 sections, 中文): LLM / embedding / vector-store selection, Chinese-aware chunking, why hybrid retrieval + RRF + rerank, the two-path refusal design, cache key design, the streaming event protocol, and the async concurrency latency write-up.
 
 ## Roadmap
 
