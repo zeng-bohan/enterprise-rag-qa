@@ -8,6 +8,8 @@
 
 面向文档问答场景的企业级 RAG 服务——多知识库管理、文档生命周期、混合检索、流式回答与多轮对话。功能对标主流知识库产品（Dify / FastGPT / RAGFlow）的能力线，用评测套件说话，不放营销数字。
 
+服务是 **API-first 设计**：所有能力都以 REST 端点交付（`/docs` 有交互式 Swagger，下方有 curl 示例），v0.6 不做 Web 控制台。
+
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
 ![Tests](https://img.shields.io/badge/tests-89%20passing%20offline-2EA043?style=flat-square)
@@ -203,6 +205,10 @@ pytest tests -q        # 89 passed
 **生成质量。** `scripts/eval_ragas.py` 用 RAGAS 为生成回答打分：
 
 - Faithfulness **94.1%**、答案相关性 **88.7%**、幻觉率 **5.9%**（n=100）——完整报告见 `data/qa_set/ragas_report.json`
+
+## 设计决策
+
+每个关键选型的理由都沉淀在 [docs/DESIGN.md](docs/DESIGN.md)（16 节）：LLM / 向量化 / 向量库选型、中文语义切片、为什么做混合检索 + RRF + 重排、双路拒答设计、缓存键设计、流式事件协议、异步并发改造的压测复盘。
 
 ## 路线图
 
