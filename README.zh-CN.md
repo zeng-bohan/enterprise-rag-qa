@@ -10,6 +10,19 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
+![Tests](https://img.shields.io/badge/tests-89%20passing%20offline-2EA043?style=flat-square)
+
+## 核心指标一览
+
+由项目自带评测套件实测——方法与完整报告见[测试与评估](#测试与评估)。
+
+| 指标 | 结果 |
+| --- | --- |
+| Recall@1 / Recall@3 / Recall@5（n=334，混合检索） | **87.4%** / **97.9%** / **98.2%** |
+| Faithfulness（RAGAS，n=100） | **94.1%** |
+| 答案相关性（RAGAS） | **88.7%** |
+| 幻觉率（RAGAS） | **5.9%** |
+| P95 延迟（异步流水线改造后） | 32s → **10s** |
 
 ## 功能特性
 
@@ -38,20 +51,24 @@
 
 ## 系统架构
 
-```text
-                        ┌────────────────────────────────────────────┐
-  upload (multipart) ──►│ Management API  /v1/kbs, /v1/kbs/{id}/docs │──► KBRegistry (PG tables / SQLite)
-                        └───────────────┬────────────────────────────┘      │ metadata: KB, document, status
-                                        │ chunks (kb_id, doc_id lineage)    ▼
-                                        ▼                        Vector store (PGvector / Chroma)
-  question ──► /v1/chat ──────► RAGPipeline
-               /v1/chat/stream ──►   1. condense (multi-turn) → query rewrite (LLM)
-                                     2. BM25 (per-KB) + vector recall, filtered by kb_id
-                                     3. reciprocal rank fusion → Cross-Encoder rerank
-                                     4. refusal floor / evidence threshold
-                                     5. DeepSeek generation with citations
-                                        ├─ JSON: answer + citations + timings
-                                        └─ SSE:  citations → token* → done
+```mermaid
+flowchart LR
+    subgraph MGMT[管理面]
+        U["upload (multipart)"] --> API["Management API<br/>/v1/kbs · /v1/kbs/{id}/docs"]
+        API --> REG["KBRegistry<br/>PG 表 / SQLite<br/>元数据：KB、文档、状态"]
+        API --> VS["向量库<br/>PGvector / Chroma<br/>切片（kb_id, doc_id 血缘）"]
+    end
+
+    subgraph PIPE[RAGPipeline]
+        Q["question<br/>/v1/chat · /v1/chat/stream"] --> C["1. 多轮压缩<br/>查询改写（LLM）"]
+        C --> R["2. BM25（按库）+ 向量召回<br/>按 kb_id 过滤"]
+        R --> F["3. 倒数排名融合 RRF<br/>→ Cross-Encoder 重排"]
+        F --> RF["4. 拒答下限 /<br/>证据阈值"]
+        RF --> G["5. DeepSeek 生成<br/>带编号引用"]
+    end
+
+    G --> J["JSON：回答 + 引用 + 耗时"]
+    G --> S["SSE：citations → token* → done"]
 ```
 
 ## 快速开始
