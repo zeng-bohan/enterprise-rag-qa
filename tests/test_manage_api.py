@@ -163,10 +163,19 @@ def test_original_is_archived_per_doc_id(wired, monkeypatch):
 def test_safe_name_blocks_traversal_and_separators():
     """断行为而不是断具体字符串：Path 对分隔符的处理本身是平台相关的。
 
-    在 Windows 上 Path(r"a\\b\\c.md").name 得到 "c.md"（反斜杠是分隔符），
-    在 Linux 上得到 "a\\b\\c.md" 再由正则替换成下划线。两种都安全，
-    所以契约只有一条：结果里绝不能还有目录成分或控制字符。
+    在 Windows 上 Path(r"a\\b\\c.md").name 得到 "c.md"（反斜杠是分隔符）；在 Linux 上
+    反斜杠不是分隔符，整串被当成一个文件名，再由正则替换成下划线。两种结果都安全，
+    所以契约只有两条：
+
+      1. 结果不得含任何目录成分 —— 用 Path(out).name == out 表达，比逐字符判断更准；
+      2. 结果不得含控制字符，且长度有界。
+
+    曾经多写了第三条 `assert ".." not in out`，被 CI 的 Linux runner 直接证伪：
+    输入 r"..\\..\\windows\\system32" 净化后是 "_.._windows_system32"，其中的 ".."
+    只是文件名的一部分——没有分隔符就穿越不了任何东西。
     """
+    from pathlib import Path
+
     from app.api.manage import MAX_FILENAME_LEN, safe_name
 
     hostile = [
@@ -179,13 +188,16 @@ def test_safe_name_blocks_traversal_and_separators():
         "",
         "   ",
         "..",
+        "...",
+        "/",
+        "\\",
         "x" * 500,
     ]
     for raw in hostile:
         out = safe_name(raw)
         assert out, f"空文件名兜底失败：{raw!r}"
-        assert "/" not in out and "\\" not in out, f"{raw!r} → {out!r} 残留目录成分"
-        assert ".." not in out, f"{raw!r} → {out!r} 仍可穿越"
+        assert Path(out).name == out, f"{raw!r} → {out!r} 不再是单个路径分量"
+        assert "/" not in out and "\\" not in out, f"{raw!r} → {out!r} 残留目录分隔符"
         assert len(out) <= MAX_FILENAME_LEN
         assert not any(ord(ch) < 0x20 for ch in out), f"{raw!r} → {out!r} 残留控制字符"
     assert safe_name("../../etc/passwd") == "passwd"
