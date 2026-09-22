@@ -12,19 +12,26 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-89%20passing%20offline-2EA043?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-93%20offline%20%2B%2034%20backend%20contract-2EA043?style=flat-square)
 
 ## 核心指标一览
 
 由项目自带评测套件实测——方法与完整报告见[测试与评估](#测试与评估)。
 
+> **评测方法学正在修订中。** 下表是对当前流水线的真实测量值，不是估算；但对评测集构造方式
+> 的复审暴露了三处局限，它们会改变这些数字的呈现方式（置信区间、分层抽样、异构裁判模型、
+> 以及拒答率的负样本基线），跟踪工单 21–28。有两点可以直接从 `data/qa_set/` 里的文件复算出来，
+> 先说清楚：334 个问题只覆盖 **80 个不同 gold chunk**（平均 4.2 问/块，因此有效样本是约 80 次
+> 相关试验，不是 334 次独立试验）；RAGAS 的 n=100 是 `qa_set[:100]` 的头切片，
+> 恰好**全部来自同一份文档**。
+
 | 指标 | 结果 |
 | --- | --- |
-| Recall@1 / Recall@3 / Recall@5（n=334，混合检索） | **87.4%** / **97.9%** / **98.2%** |
-| Faithfulness（RAGAS，n=100） | **94.1%** |
+| Recall@1 / Recall@3 / Recall@5（n=334 行 / 80 个独立 gold chunk，混合检索） | **87.4%** / **97.9%** / **98.2%** |
+| Faithfulness（RAGAS，n=100 头切片，同家族模型自评） | **94.1%** |
 | 答案相关性（RAGAS） | **88.7%** |
 | 幻觉率（RAGAS） | **5.9%** |
-| P95 延迟（异步流水线改造后） | 32s → **10s** |
+| P95 延迟（异步流水线改造后） | 32s → **10s** —— 仅尾部延迟；两次运行的吞吐都在 ~0.9 QPS，"改造后"为预热后测量，尚未落盘为可复现报告（工单 26） |
 
 ## 功能特性
 
@@ -49,7 +56,7 @@
 - Prometheus 指标（`/metrics`）、分阶段延迟直方图、缓存/LLM 计数器。
 - Redis 不可用时优雅降级；本地模式完全不需要 Redis。
 - `/v1` 全部路由可选 API Key 认证（`X-API-Key`）；健康检查与指标保持开放。
-- 项目评测集实测：Recall@1 **87.4%**、Faithfulness **94.1%**，异步流水线改造后 P95 延迟从 **32s** 降到 **10s**。
+- 项目评测集实测：Recall@1 **87.4%**、Faithfulness **94.1%**，异步流水线改造后 P95 延迟从 **32s** 降到 **10s**。这些数字测于评测方法学修订之前，口径见[测试与评估](#测试与评估)。
 
 ## 系统架构
 
@@ -195,16 +202,27 @@ docker-compose.yml
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests -q        # 89 passed
+pytest tests -q                    # 全部（93 离线 + 34 后端契约）
+pytest tests -m "not contract" -q  # 只跑离线：不需要 PostgreSQL / Redis / 模型
+pytest tests -m contract -q        # 需要先 docker compose up -d
 ```
+
+测试套件刻意分成两半。离线那一半是这个项目好上手的原因——任何人 clone 下来几秒就能全跑。
+但它把存储层整体打桩，因此看不见 SQL：`PGvectorStore`、`ChromaStore`、`PGKBRegistry`、
+`BGEEmbeddings` 四个类没有被任何一个离线用例引用过，于是一个只在 PG 后端才会触发的 bug
+（注册中心里 SQL 占位符写错）可以合进 main 而 CI 全绿。契约测试补的正是这个盲区：
+两个后端跑**同一套断言**——知识库/文档生命周期、删除级联、跨库隔离，以及拒答阈值附近的
+跨后端分数口径一致性。在 CI 里连不上 PostgreSQL 是**失败**，不是跳过。
 
 **检索评测。** `scripts/gen_qa_set.py` 构建切片接地的 QA 集（每题只能由唯一切片回答；10% 人工抽检），`scripts/eval_recall.py` 测量混合检索相对纯向量基线的 Recall@k：
 
-- Recall@1 **87.4%** / Recall@3 **97.9%** / Recall@5 **98.2%**（n=334，混合检索）——完整报告见 `data/qa_set/recall_report.json`
+- Recall@1 **87.4%** / Recall@3 **97.9%** / Recall@5 **98.2%**（n=334 行 / 80 个独立 gold chunk，混合检索）——完整报告见 `data/qa_set/recall_report.json`
 
 **生成质量。** `scripts/eval_ragas.py` 用 RAGAS 为生成回答打分：
 
-- Faithfulness **94.1%**、答案相关性 **88.7%**、幻觉率 **5.9%**（n=100）——完整报告见 `data/qa_set/ragas_report.json`
+- Faithfulness **94.1%**、答案相关性 **88.7%**、幻觉率 **5.9%**（n=100 头切片，且裁判与生成同模型家族）——完整报告见 `data/qa_set/ragas_report.json`
+
+上述两项评测都在重做中（分层抽样、按 chunk 去重并给置信区间、异构裁判模型、测拒答率的负样本集、落盘的压测报告），见工单 21–28。在那之前，请把上面的数字理解为**真实测得、但方法学尚未收敛**。
 
 ## 设计决策
 
