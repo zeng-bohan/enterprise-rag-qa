@@ -174,15 +174,18 @@ def _pg_snapshot(backend: str) -> dict:
     from psycopg import connect
 
     with connect(settings.postgres_dsn, autocommit=True) as conn:
-        # 快照发生在 fixture 建表之前——第一次跑时 kbs/chunks 可能还不存在，
-        # 那就等价于「基线为空」，不能用它把用例打成 ERROR
-        exists = conn.execute("SELECT to_regclass('public.kbs')").fetchone()[0]
-        if exists is None:
-            return {"kbs": set(), "chunks": set(), "docs": set()}
-        kbs = {r[0] for r in conn.execute("SELECT kb_id FROM kbs").fetchall()}
-        chunks = {r[0] for r in conn.execute("SELECT id FROM chunks").fetchall()}
-        docs = {r[0] for r in conn.execute("SELECT doc_id FROM documents").fetchall()}
-    return {"kbs": kbs, "chunks": chunks, "docs": docs}
+        # 逐表探测，而不是「kbs 在就假定三张表都在」：注册中心的 _init_schema 只建
+        # kbs/documents，chunks 是向量库的 _init_schema 建的。只构造注册中心的那个
+        # 用例里，chunks 完全可能还不存在——按表探测才不会把 setup 打成 ERROR。
+        out: dict = {}
+        for table, column in (("kbs", "kb_id"), ("chunks", "id"), ("documents", "doc_id")):
+            exists = conn.execute("SELECT to_regclass(%s)", (f"public.{table}",)).fetchone()[0]
+            out[table] = (
+                {r[0] for r in conn.execute(f"SELECT {column} FROM {table}").fetchall()}
+                if exists is not None
+                else set()
+            )
+    return {"kbs": out["kbs"], "chunks": out["chunks"], "docs": out["documents"]}
 
 
 def _restore_pg_snapshot(backend: str, before: dict) -> None:
@@ -192,14 +195,17 @@ def _restore_pg_snapshot(backend: str, before: dict) -> None:
         from psycopg import connect
 
         with connect(settings.postgres_dsn, autocommit=True) as conn:
-            now_kbs = {r[0] for r in conn.execute("SELECT kb_id FROM kbs").fetchall()}
-            now_chunks = {r[0] for r in conn.execute("SELECT id FROM chunks").fetchall()}
-            new_chunks = list(now_chunks - before["chunks"])
-            new_kbs = list(now_kbs - before["kbs"])
-            if new_chunks:
-                conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (new_chunks,))
-            if new_kbs:
-                conn.execute("DELETE FROM documents WHERE kb_id = ANY(%s)", (new_kbs,))
-                conn.execute("DELETE FROM kbs WHERE kb_id = ANY(%s)", (new_kbs,))
+            if conn.execute("SELECT to_regclass('public.chunks')").fetchone()[0] is not None:
+                now_chunks = {r[0] for r in conn.execute("SELECT id FROM chunks").fetchall()}
+                new_chunks = list(now_chunks - before["chunks"])
+                if new_chunks:
+                    conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (new_chunks,))
+            if conn.execute("SELECT to_regclass('public.kbs')").fetchone()[0] is not None:
+                now_kbs = {r[0] for r in conn.execute("SELECT kb_id FROM kbs").fetchall()}
+                new_kbs = list(now_kbs - before["kbs"])
+                if new_kbs:
+                    if conn.execute("SELECT to_regclass('public.documents')").fetchone()[0] is not None:
+                        conn.execute("DELETE FROM documents WHERE kb_id = ANY(%s)", (new_kbs,))
+                    conn.execute("DELETE FROM kbs WHERE kb_id = ANY(%s)", (new_kbs,))
     except Exception:  # noqa: BLE001 - 清理失败不应把已通过的结果改写成错误
         pass

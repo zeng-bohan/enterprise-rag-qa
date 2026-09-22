@@ -206,11 +206,6 @@ def test_manage_api_against_real_postgres(tmp_path, monkeypatch):
     from .conftest import _require_pg_or_skip, build_store
 
     _require_pg_or_skip()
-    from psycopg import connect
-
-    with connect(settings.postgres_dsn, autocommit=True) as conn:
-        for table in ("chunks", "documents", "kbs"):
-            conn.execute(f"DROP TABLE IF EXISTS {table}")  # 干净 schema，触发 _init_schema 重建
 
     store = build_store("pg", tmp_path, monkeypatch, collection="contract-http")
     registry = PGKBRegistry(settings.postgres_dsn)
@@ -260,12 +255,21 @@ def test_manage_api_against_real_postgres(tmp_path, monkeypatch):
     assert client.delete(f"/v1/kbs/{kb_id}").status_code == 204
 
     # 后端不可用必须是 503，不能伪装成 404 / 409（工单 02）
-    with connect(settings.postgres_dsn, autocommit=True) as conn:
-        # CASCADE：documents 上有指向 kbs 的外键，不带 CASCADE .drop 不掉
-        conn.execute("DROP TABLE IF EXISTS documents CASCADE")
-        conn.execute("DROP TABLE IF EXISTS kbs CASCADE")
-    r = client.get("/v1/kbs")
-    assert r.status_code == 503, f"表被删掉后应报后端故障，实际 {r.status_code}: {r.text}"
+    #
+    # 用 RENAME 而不是 DROP 来制造「表不见了」：这个库可能被别的会话共用，
+    # DROP 会把库留在半残状态并污染后续用例（本仓曾经就这样挂过 16 个 error）。
+    # RENAME 是同一步可逆操作，断言完再改回来。
+    from psycopg import connect
 
     with connect(settings.postgres_dsn, autocommit=True) as conn:
-        conn.execute("DROP TABLE IF EXISTS chunks CASCADE")
+        conn.execute("ALTER TABLE kbs RENAME TO kbs_hidden_by_contract_test")
+    try:
+        r = client.get("/v1/kbs")
+        assert r.status_code == 503, f"表不可见时应报后端故障，实际 {r.status_code}: {r.text}"
+        assert "存储后端故障" in r.json()["detail"]
+    finally:
+        with connect(settings.postgres_dsn, autocommit=True) as conn:
+            conn.execute("ALTER TABLE kbs_hidden_by_contract_test RENAME TO kbs")
+
+    # 恢复之后必须立刻可用——否则上面的 503 只是把连接池弄坏了，测的不是翻译逻辑
+    assert client.get("/v1/kbs").status_code == 200
