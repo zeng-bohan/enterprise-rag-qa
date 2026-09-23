@@ -33,6 +33,15 @@ class Cache:
     def available(self) -> bool:
         return self._client is not None
 
+    @property
+    def raw_client(self):
+        """需要 Redis 原生命令（INCR / EXPIRE 这类）时的受控出口。
+
+        存在的理由：速率限制要的是原子计数，而本类的 get_json/set_json 表达不了；
+        让对方直接摸 `cache._client` 是把私有实现变成事实契约。宁可显式开一个口。
+        """
+        return self._client
+
     @staticmethod
     def key(*parts: str) -> str:
         return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()

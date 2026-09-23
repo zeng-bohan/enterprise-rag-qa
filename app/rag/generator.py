@@ -13,15 +13,20 @@
 - 流式（v0.6）：astream_answer 以「事件流」产出（citations → token* → done），
   API 层原样转成 SSE；拒答与缓存命中也走同一事件协议，前端零特判。
 """
+import time
 from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.cache import Cache, get_cache
+from app.core.flight import SingleFlight
 from app.core.llm import get_llm
-from app.core.metrics import cache_hit, cache_miss, llm_timer
+from app.core.metrics import FIRST_TOKEN, cache_hit, cache_miss, llm_timer
 from app.rag.vector_store import _doc_id
+
+# 进程内并发去重（见 app/core/flight.py 的取舍说明）
+ANSWER_FLIGHT = SingleFlight()
 
 SYSTEM_PROMPT = """你是企业知识库智能助手。请严格依据【参考资料】回答用户问题，规则如下：
 1. 只使用参考资料中的内容作答，不要使用外部知识，也不要编造；
@@ -102,17 +107,26 @@ def _user_prompt(question: str, context: str, history: Optional[List[Dict[str, s
     return user
 
 
+def _cache_key(question: str, docs_with_scores) -> Optional[str]:
+    """语义缓存键 = 问题 + 命中文档内容哈希集。多轮请求返回 None（不缓存）。
+
+    键里带命中文档集合，是为了让"知识库更新过"自动等于"旧缓存失效"：检索结果
+    变了键就变，不会把上一个知识状态的答案返回给新查询。
+    多轮请求整体旁路缓存：键里没有历史，命中就会返回与上文无关的脏答案，
+    宁可不缓存。
+    """
+    doc_sig = ",".join(sorted(_doc_id(d) for d, _ in docs_with_scores))
+    return Cache.key("answer", question, doc_sig)
+
+
 def _cache_lookup(cache: Cache, question: str, docs_with_scores, history) -> Optional[dict]:
-    # 多轮请求不走语义缓存：缓存键不含历史，命中会返回与上下文无关的脏答案
     if history:
         return None
-    doc_sig = ",".join(sorted(_doc_id(d) for d, _ in docs_with_scores))
-    return cache.get_json(Cache.key("answer", question, doc_sig))
+    return cache.get_json(_cache_key(question, docs_with_scores))
 
 
 def _cache_write(cache: Cache, question: str, docs_with_scores, answer: str) -> None:
-    doc_sig = ",".join(sorted(_doc_id(d) for d, _ in docs_with_scores))
-    cache.set_json(Cache.key("answer", question, doc_sig), {"a": answer})
+    cache.set_json(_cache_key(question, docs_with_scores), {"a": answer})
 
 
 def generate(
@@ -158,7 +172,11 @@ async def agenerate(
 ) -> dict:
     """异步版 generate（v0.5）：生成 LLM 用 ainvoke，等待不占线程。
 
-    缓存读写仍是同步 Redis（单次约 1ms），不值得为它做事件循环往返。
+    缓存读写是同步 Redis（单次约 1ms），不值得为它做事件循环往返。
+
+    工单 16：miss 之后的"打 LLM + 写缓存"包在 SingleFlight 里。以前读-算-写三步
+    之间没有任何互斥，8 个客户端同时问同一个问题就是 8 次 miss、8 次 LLM 调用、
+    8 次写缓存 —— 这既是并发场景下 P95 的主因，也是纯浪费的 token 成本。
     """
     if not docs_with_scores:
         return {"answer": REFUSAL_ANSWER, "citations": [], "grounded": False, "cached": False}
@@ -172,14 +190,29 @@ async def agenerate(
         return {"answer": hit["a"], "citations": citations, "grounded": True, "cached": True}
     cache_miss("answer")
 
-    llm = get_llm()
-    with llm_timer():
-        resp = await llm.ainvoke(
-            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
-        )
-    answer = resp.content or ""
-    if not history:
-        _cache_write(cache, question, docs_with_scores, answer)
+    # 多轮请求没有缓存键（键里不含历史），因此也不参与去重：每个上文都是独立的
+    key = None if history else _cache_key(question, docs_with_scores)
+
+    async def _produce() -> str:
+        # 排队等待期间可能已经有别的请求把答案写进缓存了，进 LLM 之前再看一眼
+        if key is not None:
+            late = cache.get_json(key)
+            if late and late.get("a"):
+                return late["a"]
+        llm = get_llm()
+        with llm_timer():
+            resp = await llm.ainvoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=_user_prompt(question, context, history)),
+                ]
+            )
+        answer = resp.content or ""
+        if key is not None:
+            cache.set_json(key, {"a": answer})
+        return answer
+
+    answer = await (ANSWER_FLIGHT.run(key, _produce) if key is not None else _produce())
     return {"answer": answer, "citations": citations, "grounded": True, "cached": False}
 
 
@@ -216,12 +249,19 @@ async def astream_answer(
     context, _ = build_context(docs_with_scores)
     llm = get_llm()
     parts: List[str] = []
+    # 体感延迟的关键是"多久看到第一个字"，而不是总耗时 —— 只看 LLM_LATENCY 会把
+    # 「2s 出首 token 共 10s」和「10s 才出首 token」记成同一个数
+    t_first = time.perf_counter()
+    first_seen = False
     with llm_timer():
         async for chunk in llm.astream(
             [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
         ):
             token = chunk.content or ""
             if token:
+                if not first_seen:
+                    FIRST_TOKEN.observe(time.perf_counter() - t_first)
+                    first_seen = True
                 parts.append(token)
                 yield {"event": "token", "data": {"t": token}}
 

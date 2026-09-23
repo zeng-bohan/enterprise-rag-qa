@@ -81,6 +81,25 @@ class PGvectorStore:
         )
         self._init_schema()
 
+    def __init__(self) -> None:
+        self._embeddings = BGEEmbeddings()
+        self._pool = ConnectionPool(
+            settings.postgres_dsn,
+            min_size=1,
+            max_size=8,
+            kwargs={"autocommit": True},
+            # 每条新连接带上查询期的 HNSW 候选队列长度。放在 configure 而不是每条
+            # query 前 SET 一次：省一次往返，且 autocommit 下 SET LOCAL 根本不生效。
+            configure=self._configure_conn,
+            open=True,
+        )
+        self._init_schema()
+
+    @staticmethod
+    def _configure_conn(conn) -> None:
+        if settings.ann_index == "hnsw":
+            conn.execute(f"SET hnsw.ef_search = {int(settings.hnsw_ef_search)}")
+
     def _init_schema(self) -> None:
         with self._pool.connection() as conn:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -103,6 +122,35 @@ class PGvectorStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_kb ON chunks(kb_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash)")
+            self._ensure_ann_index(conn)
+
+    def _ensure_ann_index(self, conn) -> None:
+        """embedding 列上的近似最近邻索引（工单 09）。
+
+        修复前这里只有 kb_id / doc_id 两个 btree，`ORDER BY embedding <=> $1` 因此
+        是全表顺序扫描 + 逐行算距离 + 排序：几千 chunk 时 P95 看不出来，十万级
+        这一条就是主要延迟来源，README 里的 P95 数字随之失效。
+
+        一个必须写下来的前提：带 `WHERE kb_id = %s` 过滤时 HNSW 会在图上取够候选
+        之前就被过滤条件剪断，所以**索引不是免费的加速器** —— 过滤选择性强时，
+        不加大 ef_search 反而可能既慢又漏。实测数据见 data/bench/ann_report.json。
+        """
+        if settings.ann_index == "none":
+            conn.execute("DROP INDEX IF EXISTS idx_chunks_embedding")
+            return
+        if settings.ann_index == "ivfflat":
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks"
+                f" USING ivfflat (embedding vector_cosine_ops) WITH (lists = {settings.ivfflat_lists})"
+            )
+            return
+        if settings.ann_index != "hnsw":
+            raise ValueError(f"未知 ANN_INDEX：{settings.ann_index}（可选 hnsw / ivfflat / none）")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks"
+            " USING hnsw (embedding vector_cosine_ops)"
+            f" WITH (m = {settings.hnsw_m}, ef_construction = {settings.hnsw_ef_construction})"
+        )
 
     def add_documents(self, docs: List[Document], kb_id: str, doc_id: str) -> int:
         """写入一批 chunk，血缘（kb_id/doc_id）同时进列与 metadata。
@@ -203,6 +251,14 @@ class PGvectorStore:
                 "SELECT count(*) FROM chunks WHERE kb_id = %s", (kb_id,)
             ).fetchone()[0]
 
+    def counts_by_kb(self) -> dict:
+        """一次 GROUP BY 取回 {kb_id: chunk 数}（工单 17，替代每库一次的 count）。"""
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT kb_id, count(*) FROM chunks GROUP BY kb_id"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
 
 class ChromaStore:
     """Chroma 本地后端（降级/开发用）。血缘存在 chunk metadata 里。"""
@@ -276,6 +332,19 @@ class ChromaStore:
         if kb_id is None:
             return self._store._collection.count()
         return len(self._store.get(where={"kb_id": kb_id}, include=[])["ids"])
+
+    def counts_by_kb(self) -> dict:
+        """Chroma 没有 GROUP BY，退化成「一次取全部 id+metadata，本地分组」。
+
+        仍然优于旧写法的 N+1 次全集合扫描：这里只有一趟 get。include=[] 表示
+        不要 documents/embeddings，只取元数据，是这个接口上最便宜的形式。
+        """
+        data = self._store.get(include=[], where=None)
+        out: dict = {}
+        for meta in data["metadatas"] or []:
+            kb = (meta or {}).get("kb_id", "")
+            out[kb] = out.get(kb, 0) + 1
+        return out
 
 
 def get_store():

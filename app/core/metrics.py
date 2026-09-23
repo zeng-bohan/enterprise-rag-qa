@@ -28,6 +28,14 @@ CACHE_HITS = Counter("rag_cache_hits_total", "缓存命中计数", ["kind"])
 CACHE_MISSES = Counter("rag_cache_misses_total", "缓存未命中计数", ["kind"])
 LLM_CALLS = Counter("rag_llm_calls_total", "LLM 调用次数（改写 + 生成）")
 LLM_LATENCY = Histogram("rag_llm_latency_seconds", "LLM 调用耗时", buckets=_LATENCY_BUCKETS)
+# 流式问答真正决定体感的不是总耗时，而是"多久看到第一个字"。只看 LLM_LATENCY
+# 会把「2s 出首 token、共 10s」和「10s 才出首 token」记成同一个数。
+FIRST_TOKEN = Histogram(
+    "rag_llm_first_token_seconds",
+    "流式生成：请求到首个 token 的耗时",
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 15.0, 30.0),
+)
+RATE_LIMITED = Counter("rag_rate_limited_total", "被限流拒绝的请求数")
 
 
 def llm_start() -> float:
