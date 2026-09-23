@@ -12,14 +12,14 @@ from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.api import chat, manage
-from app.core.executor import run_cpu
+from app.core.executor import run_meta
 from app.rag.registry import get_registry
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # 默认知识库幂等创建：脚本入库 / 单库问答的落点
-    await run_cpu(get_registry().ensure_default)
+    await run_meta(get_registry().ensure_default)
     yield
 
 
