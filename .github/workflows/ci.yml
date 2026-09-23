@@ -1,12 +1,21 @@
 name: CI
 
+# 两个 job 的分工是这套测试体系的核心，不要合并：
+#   offline  —— 不依赖任何外部服务、不下载模型，任何人 clone 下来都能秒跑；
+#   contract —— 真 PostgreSQL(pgvector) + 真 Chroma，两个后端跑同一套断言。
+#
+# 为什么要拆开：原本 CI 只有离线那一套，而 PGvectorStore / ChromaStore /
+# PGKBRegistry / BGEEmbeddings 四个类在测试里一次都没被引用过，于是 psycopg3
+# 下写成 ? 的 SQL 占位符能一路合进 main 且 CI 全绿（工单 01）。
+# contract job 就是为了让那种事不可能再发生一次。
+
 on:
   push:
     branches: [main]
   pull_request:
 
 jobs:
-  test:
+  offline:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,5 +25,38 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
-      - name: Run tests
-        run: pytest tests -q
+      - name: Run offline tests (no PG / Redis / models)
+        # 显式排除 contract：这个 job 必须能在没有任何外部服务的环境里成立，
+        # 否则贡献者本地跑不通 CI 就等于没有 CI
+        run: pytest tests -m "not contract" -q
+
+  contract:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ragkb
+          POSTGRES_PASSWORD: ragkb123
+          POSTGRES_DB: rag_kb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ragkb -d rag_kb"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      VECTOR_BACKEND: pgvector
+      POSTGRES_DSN: postgresql://ragkb:ragkb123@127.0.0.1:5432/rag_kb
+      # 关键：CI 里 Postgres 连不上就是 job 失败，不允许降级成 skip。
+      # 少了这个开关，「契约测试通过」可以由「全部跳过」得到，门禁形同虚设。
+      RAG_CONTRACT_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run backend contract tests (pgvector + chroma)
+        run: pytest tests -m contract -q
