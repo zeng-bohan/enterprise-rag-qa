@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.api import deps
 from app.main import app
+from app.config import settings
 from app.rag.registry import SQLiteKBRegistry
 from tests.conftest import FakeStore
 
@@ -37,6 +38,13 @@ class RecordingStore(FakeStore):
 
     def count(self, kb_id=None) -> int:
         return sum(n for kb, _, n in self.ingested if kb_id is None or kb == kb_id)
+
+    def counts_by_kb(self) -> dict:
+        # 工单 17：list_kbs 改用一次聚合，替身必须同步实现，否则接口漂移藏在桩里
+        out: dict = {}
+        for kb, _, n in self.ingested:
+            out[kb] = out.get(kb, 0) + n
+        return out
 
 
 class RecordingRetriever:
@@ -235,3 +243,138 @@ def test_retrieval_test_endpoint(wired):
     assert body["hits"][0]["source"] == "手册.md"
     assert body["hits"][0]["score"] == 0.91
     assert "retrieval_ms" in body
+
+
+# ---------------------------------------------------------------------------
+# Wave 2：聚合查询与边界防护
+# ---------------------------------------------------------------------------
+def test_list_kbs_uses_aggregates_not_per_kb_queries(wired):
+    """工单 17：3 个知识库只该发 2 条聚合查询，而不是 2N+1 条。"""
+    store, retriever, registry = wired
+    seen = {"store.count": 0, "list_documents": 0}
+    real_count, real_docs = store.count, registry.list_documents
+
+    def spy_count(*a, **k):
+        seen["store.count"] += 1
+        return real_count(*a, **k)
+
+    def spy_docs(*a, **k):
+        seen["list_documents"] += 1
+        return real_docs(*a, **k)
+
+    store.count = spy_count
+    registry.list_documents = spy_docs
+
+    for name in ("甲库", "乙库", "丙库"):
+        assert client.post("/v1/kbs", json={"name": name}).status_code == 201
+    body = client.get("/v1/kbs").json()
+    assert len(body) == 3
+    assert seen["store.count"] == 0, "list_kbs 退回了逐库 count（N+1 复活）"
+    assert seen["list_documents"] == 0, "list_kbs 退回了逐库 list_documents（N+1 复活）"
+    assert {k["document_count"] for k in body} == {0}
+    assert {k["chunk_count"] for k in body} == {0}
+
+
+def test_list_kbs_reports_real_counts_from_aggregates(wired):
+    """聚合改写不能把数字算错。"""
+    store, retriever, registry = wired
+    kb_id = client.post("/v1/kbs", json={"name": "计数库"}).json()["kb_id"]
+    r = client.post(
+        f"/v1/kbs/{kb_id}/documents",
+        files={"file": ("手册.md", "# 手册\n年假 15 天。\n" * 6, "text/markdown")},
+    )
+    doc = r.json()
+    row = next(k for k in client.get("/v1/kbs").json() if k["kb_id"] == kb_id)
+    assert row["document_count"] == 1
+    assert row["chunk_count"] == doc["chunk_count"]
+
+
+def test_upload_over_limit_returns_413(wired, monkeypatch):
+    """工单 20：超限必须在读取阶段就拒绝，不能先把 2GB 收进内存再判。"""
+    store, retriever, registry = wired
+    monkeypatch.setattr(settings, "max_upload_mb", 1, raising=False)
+    kb_id = client.post("/v1/kbs", json={"name": "大文件库"}).json()["kb_id"]
+
+    r = client.post(
+        f"/v1/kbs/{kb_id}/documents",
+        files={"file": ("巨大.md", "#" + "x" * (2 * 1024 * 1024), "text/markdown")},
+    )
+    assert r.status_code == 413, f"{r.status_code}: {r.text[:200]}"
+    assert store.ingested == [], "超限文件不得进入索引流程"
+    assert registry.list_documents(kb_id) == [], "超限上传不该留下文档记录"
+
+
+def test_rate_limit_disabled_by_default(wired, monkeypatch):
+    """默认关闭限流：一次安全加固不该悄悄改变现有部署的行为。"""
+    monkeypatch.setattr(settings, "rate_limit_rps", 0.0, raising=False)
+    wired
+    for _ in range(30):
+        assert client.get("/v1/kbs").status_code == 200
+
+
+def test_rate_limit_falls_open_when_redis_is_down(wired, monkeypatch):
+    """限流是保护措施，不能变成新的单点：Redis 不可用时放行而不是拒绝。"""
+    import app.core.auth as auth_mod
+
+    monkeypatch.setattr(settings, "rate_limit_rps", 1.0, raising=False)
+    monkeypatch.setattr(settings, "rate_limit_burst", 2, raising=False)
+
+    class Unreachable:
+        available = False
+        raw_client = None
+
+    monkeypatch.setattr(auth_mod, "get_cache", lambda: Unreachable())
+    for _ in range(5):
+        assert client.get("/v1/kbs").status_code == 200
+
+
+def test_rate_limit_returns_429_beyond_burst(wired, monkeypatch):
+    """开限流后超过 burst 要回 429，并带 Retry-After。"""
+    import app.core.auth as auth_mod
+
+    store, retriever, registry = wired
+    monkeypatch.setattr(settings, "rate_limit_rps", 1.0, raising=False)
+    monkeypatch.setattr(settings, "rate_limit_burst", 3, raising=False)
+
+    class Counting:
+        def __init__(self):
+            self.n = 0
+
+        def incr(self, key):
+            self.n += 1
+            return self.n
+
+        def expire(self, key, ttl):
+            return None
+
+    class Up:
+        def __init__(self):
+            self.client = Counting()
+
+        @property
+        def available(self):
+            return True
+
+        @property
+        def raw_client(self):
+            return self.client
+
+    shared = Up()  # 必须是同一个实例：每次调用新建计数器就永远不超限
+    monkeypatch.setattr(auth_mod, "get_cache", lambda: shared)
+    codes = [client.get("/v1/kbs").status_code for _ in range(6)]
+    assert codes[:3] == [200] * 3, codes
+    assert 429 in codes, f"超过 burst 之后应当限流：{codes}"
+    limited = client.get("/v1/kbs")
+    assert limited.status_code == 429 and limited.headers.get("retry-after") == "1"
+
+
+def test_api_key_comparison_is_backend_of_constant_time():
+    """常量时间改写不得改变语义：每个配置的 key 都要能过，非 key 要挡住。"""
+    from app.core.auth import _key_matches
+
+    configured = ["key-one", "key-two", "key-three"]
+    for k in configured:
+        assert _key_matches(k, configured), k
+    assert not _key_matches("key-1", configured)
+    assert not _key_matches("", configured)
+    assert not _key_matches("KEY-ONE", configured)  # 大小写敏感，不能被"顺手兼容"放宽
