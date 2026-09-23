@@ -20,7 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.cache import Cache, get_cache
 from app.core.llm import get_llm
-from app.core.metrics import CACHE_HITS, CACHE_MISSES, llm_done, llm_start
+from app.core.metrics import cache_hit, cache_miss, llm_timer
 from app.rag.vector_store import _doc_id
 
 SYSTEM_PROMPT = """你是企业知识库智能助手。请严格依据【参考资料】回答用户问题，规则如下：
@@ -121,6 +121,12 @@ def generate(
     cache: Optional[Cache] = None,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> dict:
+    """同步生成。评测与压测脚本走这条路径。
+
+    工单 07：这条路径以前完全不记缓存命中与 LLM 耗时（只有 agenerate 记），
+    于是 bench / eval 产出的数字和 Prometheus 面板上的数字是两个口径。
+    现在两条路径共用 llm_timer / cache_hit / cache_miss，不可能再分叉。
+    """
     if not docs_with_scores:
         return {"answer": REFUSAL_ANSWER, "citations": [], "grounded": False, "cached": False}
 
@@ -129,12 +135,15 @@ def generate(
     cache = cache or get_cache()
     hit = _cache_lookup(cache, question, docs_with_scores, history)
     if hit and hit.get("a"):
+        cache_hit("answer")
         return {"answer": hit["a"], "citations": citations, "grounded": True, "cached": True}
+    cache_miss("answer")
 
     llm = get_llm()
-    resp = llm.invoke(
-        [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
-    )
+    with llm_timer():
+        resp = llm.invoke(
+            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
+        )
     answer = resp.content or ""
     if not history:
         _cache_write(cache, question, docs_with_scores, answer)
@@ -159,16 +168,15 @@ async def agenerate(
     cache = cache or get_cache()
     hit = _cache_lookup(cache, question, docs_with_scores, history)
     if hit and hit.get("a"):
-        CACHE_HITS.labels(kind="answer").inc()
+        cache_hit("answer")
         return {"answer": hit["a"], "citations": citations, "grounded": True, "cached": True}
-    CACHE_MISSES.labels(kind="answer").inc()
+    cache_miss("answer")
 
     llm = get_llm()
-    t0 = llm_start()
-    resp = await llm.ainvoke(
-        [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
-    )
-    llm_done(t0)
+    with llm_timer():
+        resp = await llm.ainvoke(
+            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
+        )
     answer = resp.content or ""
     if not history:
         _cache_write(cache, question, docs_with_scores, answer)
@@ -199,17 +207,16 @@ async def astream_answer(
     cache = cache or get_cache()
     hit = _cache_lookup(cache, question, docs_with_scores, history)
     if hit and hit.get("a"):
-        CACHE_HITS.labels(kind="answer").inc()
+        cache_hit("answer")
         yield {"event": "token", "data": {"t": hit["a"]}}
         yield {"event": "done", "data": {"grounded": True, "cached": True}}
         return
-    CACHE_MISSES.labels(kind="answer").inc()
+    cache_miss("answer")
 
     context, _ = build_context(docs_with_scores)
     llm = get_llm()
-    t0 = llm_start()
     parts: List[str] = []
-    try:
+    with llm_timer():
         async for chunk in llm.astream(
             [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=_user_prompt(question, context, history))]
         ):
@@ -217,8 +224,6 @@ async def astream_answer(
             if token:
                 parts.append(token)
                 yield {"event": "token", "data": {"t": token}}
-    finally:
-        llm_done(t0)
 
     answer = "".join(parts)
     if not history:

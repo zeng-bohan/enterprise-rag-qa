@@ -26,9 +26,40 @@ from app.config import settings
 from app.core.embeddings import BGEEmbeddings
 
 
+def content_hash(text: str) -> str:
+    """chunk 正文的内容哈希。
+
+    这是「这段文字是什么」的身份，与它属于哪个文档 / 哪个知识库无关。
+    语义缓存键（app/rag/generator.py）与评测集的 gold 匹配用的都是它。
+    """
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def chunk_uid(doc_id: str, text: str) -> str:
+    """存储层主键：内容哈希 + 所属文档。
+
+    为什么必须带 doc_id（工单 03）：以前主键就是 content_hash(text)，而写入语句是
+    ON CONFLICT (id) DO UPDATE SET kb_id = EXCLUDED.kb_id, doc_id = EXCLUDED.doc_id。
+    于是同一段文本第二次入库时，那一行不是新增、而是**被改挂到新文档名下**。
+    触发场景都很日常：
+      - 同一份文件重复上传 → 新 doc_id 抢走旧 doc 的全部 chunk，删除任一文档
+        都会物理带走另一个文档的内容，而 registry 里的 chunk_count 还写着旧值；
+      - 同一份制度文档传进两个知识库 → kb_id 被最后一次写入覆盖，
+        原知识库里的这段内容静默消失（search 是带 WHERE kb_id 过滤的）。
+    主键收敛到「同一文档内去重」之后，跨文档 / 跨库的同内容 chunk 各自独立。
+    （冒号分隔符在 Chroma 的 id 校验下同样可用，已实测。）
+    """
+    return f"{doc_id}:{content_hash(text)}"
+
+
 def _doc_id(doc: Document) -> str:
-    """按内容哈希生成稳定 chunk id：同一内容重复入库自动覆盖，脚本可幂等执行。"""
-    return hashlib.md5(doc.page_content.encode("utf-8")).hexdigest()
+    """[兼容别名] 按内容哈希取 chunk 身份。
+
+    名字有历史包袱（doc_id 指的是「文档」，这里返回的是「chunk 内容哈希」），
+    新代码请用 content_hash(text) 或 chunk_uid(doc_id, text)；保留这个别名是因为
+    生成层的缓存键与评测脚本都以「内容身份」表达 gold。
+    """
+    return content_hash(doc.page_content)
 
 
 class PGvectorStore:
@@ -66,11 +97,20 @@ class PGvectorStore:
             # v0.6 增量迁移：老库补血缘列
             conn.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS kb_id TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS doc_id TEXT NOT NULL DEFAULT ''")
+            # 工单 03：内容哈希独立成列（id 已改为 doc_id:content_hash，不再能从 id 反推），
+            # 语义缓存与评测按内容寻址时用这一列，不必再算一遍 md5
+            conn.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_kb ON chunks(kb_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash)")
 
     def add_documents(self, docs: List[Document], kb_id: str, doc_id: str) -> int:
-        """写入一批 chunk，血缘（kb_id/doc_id）同时进列与 metadata。"""
+        """写入一批 chunk，血缘（kb_id/doc_id）同时进列与 metadata。
+
+        ON CONFLICT 的语义在工单 03 之后收敛为「同一文档内去重」：主键含 doc_id，
+        所以重复内容不会再改写别的文档 / 别的知识库的归属行。
+        脚本幂等性由 content_hash 保证（同一文档重灌 → 同一批主键 → 覆盖而非翻倍）。
+        """
         for d in docs:
             d.metadata.setdefault("kb_id", kb_id)
             d.metadata.setdefault("doc_id", doc_id)
@@ -79,13 +119,23 @@ class PGvectorStore:
             register_vector(conn)
             with conn.cursor() as cur:
                 for doc, vec in zip(docs, vectors):
+                    digest = content_hash(doc.page_content)
                     cur.execute(
-                        "INSERT INTO chunks (id, kb_id, doc_id, content, metadata, embedding)"
-                        " VALUES (%s, %s, %s, %s, %s, %s)"
+                        "INSERT INTO chunks (id, kb_id, doc_id, content_hash, content, metadata, embedding)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content,"
                         " kb_id = EXCLUDED.kb_id, doc_id = EXCLUDED.doc_id,"
+                        " content_hash = EXCLUDED.content_hash,"
                         " metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding",
-                        (_doc_id(doc), kb_id, doc_id, doc.page_content, Jsonb(doc.metadata), Vector(vec)),
+                        (
+                            chunk_uid(doc_id, doc.page_content),
+                            kb_id,
+                            doc_id,
+                            digest,
+                            doc.page_content,
+                            Jsonb(doc.metadata),
+                            Vector(vec),
+                        ),
                     )
         return len(docs)
 
@@ -93,15 +143,23 @@ class PGvectorStore:
         with self._pool.connection() as conn:
             conn.execute("TRUNCATE TABLE chunks")
 
-    def delete_by_doc(self, doc_id: str) -> int:
+    def delete_by_doc(self, doc_id: str, kb_id: Optional[str] = None) -> int:
+        """删除一个文档的全部 chunk；带 kb_id 时同时校验归属（防御性，见工单 03）。"""
+        sql = "DELETE FROM chunks WHERE doc_id = %s"
+        params: list = [doc_id]
+        if kb_id is not None:
+            sql += " AND kb_id = %s"
+            params.append(kb_id)
         with self._pool.connection() as conn:
-            row = conn.execute("DELETE FROM chunks WHERE doc_id = %s RETURNING id", (doc_id,)).fetchall()
-        return len(row)
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.rowcount  # 以前是 DELETE ... RETURNING id + fetchall 只为数行数
 
     def delete_by_kb(self, kb_id: str) -> int:
         with self._pool.connection() as conn:
-            row = conn.execute("DELETE FROM chunks WHERE kb_id = %s RETURNING id", (kb_id,)).fetchall()
-        return len(row)
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM chunks WHERE kb_id = %s", (kb_id,))
+                return cur.rowcount
 
     def search(
         self, query: str, top_k: Optional[int] = None, kb_id: Optional[str] = None
@@ -165,7 +223,8 @@ class ChromaStore:
         for d in docs:
             d.metadata.setdefault("kb_id", kb_id)
             d.metadata.setdefault("doc_id", doc_id)
-        ids = [_doc_id(d) for d in docs]
+        # 主键口径与 PG 后端完全一致（doc_id:content_hash），否则两后端的去重语义会分叉
+        ids = [chunk_uid(doc_id, d.page_content) for d in docs]
         self._store.add_documents(docs, ids=ids)
         return len(docs)
 
@@ -177,15 +236,25 @@ class ChromaStore:
             pass
         self._store = self._new_store()
 
-    def delete_by_doc(self, doc_id: str) -> int:
-        before = self.count()
-        self._store.delete(where={"doc_id": doc_id})
-        return before - self.count()
+    def _delete_returning_count(self, where: dict) -> int:
+        """先按过滤条件取 ids 再删，返回真实删除数。
+
+        旧写法是 count() 前后相减——两次全集合计数换一个小整数，Chroma 的 count()
+        并不便宜；顺带修掉一个并发漏洞：相减法会把别人在此期间删掉的行算到自己头上。
+        """
+        ids = self._store.get(where=where, include=[])["ids"]
+        if ids:
+            self._store.delete(ids=ids)
+        return len(ids)
+
+    def delete_by_doc(self, doc_id: str, kb_id: Optional[str] = None) -> int:
+        where: dict = {"doc_id": doc_id}
+        if kb_id is not None:
+            where = {"$and": [{"doc_id": doc_id}, {"kb_id": kb_id}]}
+        return self._delete_returning_count(where)
 
     def delete_by_kb(self, kb_id: str) -> int:
-        before = self.count()
-        self._store.delete(where={"kb_id": kb_id})
-        return before - self.count()
+        return self._delete_returning_count({"kb_id": kb_id})
 
     def get_all_documents(self, kb_id: Optional[str] = None) -> List[Document]:
         where = {"kb_id": kb_id} if kb_id else None

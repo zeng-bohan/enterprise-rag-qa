@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -35,6 +36,39 @@ def _now() -> str:
 
 class KBError(RuntimeError):
     """知识库不存在 / 重名等业务错误，message 面向 API 直接返回。"""
+
+
+class BackendError(RuntimeError):
+    """存储后端故障（连不上 / 表缺失 / SQL 非法）。
+
+    与 KBError 严格分开：KBError 是「业务上不该有结果」→ 404/409，
+    BackendError 是「系统没能力回答」→ 503。两者混用会让运维对着
+    「知识库不存在」排查一个连接池超时。
+    """
+
+
+# 领域异常翻译只认这一个唯一约束码，其余驱动异常一律归为后端故障
+def as_domain_error(exc: Exception, duplicate_msg: str) -> RuntimeError:
+    """把驱动层异常翻译成领域异常，绝不吞掉原始异常（保留 __cause__）。
+
+    为什么单独有这个函数：这里原先写的是
+        except Exception: raise KBError("知识库创建失败（重名？）")
+    于是一个 SQL 语法错误（psycopg3 只认 %s，代码里写了 ?）也被翻译成「疑似重名」，
+    把排障方向整个带偏。规则：只有 UniqueViolation 才是业务冲突，其他都是后端故障。
+
+    返回异常对象而不直接 raise：调用方 `raise as_domain_error(...) from exc`，
+    异常链由调用点保留（return 语句里不能写 from）。
+    """
+    first_line = (str(exc).strip().splitlines() or [""])[0]
+    try:
+        from psycopg import errors as pg_errors
+    except ImportError:  # 本地模式未安装 psycopg，退化为通用后端故障
+        return BackendError(f"存储后端故障（{type(exc).__name__}）：{first_line[:200]}")
+    if isinstance(exc, pg_errors.UniqueViolation):
+        return KBError(duplicate_msg)
+    return BackendError(
+        f"存储后端故障（{type(exc).__name__}）：{first_line[:200]}"
+    )
 
 
 class KBRegistry:
@@ -70,6 +104,11 @@ class KBRegistry:
         raise NotImplementedError
 
     def delete_document(self, kb_id: str, doc_id: str) -> None:
+        raise NotImplementedError
+
+    def update_document(
+        self, kb_id: str, doc_id: str, status: str, chunk_count: Optional[int] = None, error: str = ""
+    ) -> dict:
         raise NotImplementedError
 
     def delete_documents_of_kb(self, kb_id: str) -> None:
@@ -121,15 +160,16 @@ class SQLiteKBRegistry(KBRegistry):
 
     def create_kb(self, name: str, description: str = "") -> dict:
         kb_id = uuid.uuid4().hex[:12]
+        now = _now()
         try:
             self._conn.execute(
                 "INSERT INTO kbs (kb_id, name, description, created_at) VALUES (?, ?, ?, ?)",
-                (kb_id, name, description, _now()),
+                (kb_id, name, description, now),
             )
             self._conn.commit()
         except sqlite3.IntegrityError as exc:
             raise KBError(f"知识库名已存在: {name}") from exc
-        return {"kb_id": kb_id, "name": name, "description": description}
+        return {"kb_id": kb_id, "name": name, "description": description, "created_at": now}
 
     def list_kbs(self) -> List[dict]:
         rows = self._conn.execute("SELECT kb_id, name, description, created_at FROM kbs ORDER BY created_at").fetchall()
@@ -170,6 +210,8 @@ class SQLiteKBRegistry(KBRegistry):
             "status": status,
             "chunk_count": chunk_count,
             "error": error,
+            "created_at": now,
+            "updated_at": now,
         }
 
     def list_documents(self, kb_id: str) -> List[dict]:
@@ -178,7 +220,9 @@ class SQLiteKBRegistry(KBRegistry):
             " FROM documents WHERE kb_id = ? ORDER BY created_at",
             (kb_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        # kb_id 不在上面的 SELECT 里（它是过滤条件），要显式补回，
+        # 否则与 PG 后端的返回形状不一致——契约测试 first-run 抓到的就是这条
+        return [{**dict(r), "kb_id": kb_id} for r in rows]
 
     def get_document(self, kb_id: str, doc_id: str) -> dict:
         row = self._conn.execute(
@@ -188,7 +232,7 @@ class SQLiteKBRegistry(KBRegistry):
         ).fetchone()
         if row is None:
             raise KBError(f"文档不存在: {doc_id}")
-        return dict(row)
+        return {**dict(row), "kb_id": kb_id}
 
     def delete_document(self, kb_id: str, doc_id: str) -> None:
         self.get_document(kb_id, doc_id)
@@ -199,6 +243,19 @@ class SQLiteKBRegistry(KBRegistry):
         self._conn.execute("DELETE FROM documents WHERE kb_id = ?", (kb_id,))
         self._conn.commit()
 
+    def update_document(
+        self, kb_id: str, doc_id: str, status: str, chunk_count: Optional[int] = None, error: str = ""
+    ) -> dict:
+        doc = self.get_document(kb_id, doc_id)
+        count = doc["chunk_count"] if chunk_count is None else chunk_count
+        self._conn.execute(
+            "UPDATE documents SET status = ?, chunk_count = ?, error = ?, updated_at = ?"
+            " WHERE kb_id = ? AND doc_id = ?",
+            (status, count, error, _now(), kb_id, doc_id),
+        )
+        self._conn.commit()
+        return self.get_document(kb_id, doc_id)
+
 
 class PGKBRegistry(KBRegistry):
     """生产模式：PostgreSQL（与 chunks 同库，连接池复用 store 的配置）。"""
@@ -206,8 +263,32 @@ class PGKBRegistry(KBRegistry):
     def __init__(self, dsn: str) -> None:
         from psycopg_pool import ConnectionPool
 
-        self._pool = ConnectionPool(dsn, min_size=1, max_size=4, kwargs={"autocommit": True}, open=True)
+        self._pool = ConnectionPool(
+            dsn,
+            min_size=1,
+            max_size=4,
+            kwargs={"autocommit": True},
+            # timeout：PG 挂掉时快速失败（默认 30s 会让每个请求都卡在 checkout 上，
+            # 表现为整站超时而不是一个明确的 503）
+            timeout=10,
+            # 复用的连接可能已被服务端回收（idle timeout / 重启），取回时先探一次
+            check=ConnectionPool.check_connection,
+            open=True,
+        )
         self._init_schema()
+
+    @contextmanager
+    def _conn(self):
+        """取连接并统一翻译驱动异常。
+
+        读路径不关心「重名」这类业务语义，所以只需要「异常 → BackendError」这一条规则；
+        写路径（create_kb / add_document）要区分 UniqueViolation，各自单独处理。
+        """
+        try:
+            with self._pool.connection() as conn:
+                yield conn
+        except Exception as exc:
+            raise as_domain_error(exc, str(exc)) from exc
 
     def _init_schema(self) -> None:
         with self._pool.connection() as conn:
@@ -243,41 +324,70 @@ class PGKBRegistry(KBRegistry):
             return kb_id
         return self.create_kb(settings.default_kb, "默认知识库（脚本入库 / 单库问答）")["kb_id"]
 
+    @staticmethod
+    def _iso(value) -> str:
+        """TIMESTAMPTZ(datetime) → ISO 字符串，与 SQLite 侧直接存文本的口径对齐。
+
+        两个后端返回的 dict 形状必须完全一致（同一套键、同样的值类型），否则
+        换后端就是换 API 契约。这一条以前没人管：PG 侧的读方法一律漏掉了
+        created_at / updated_at，SQLite 侧带着 —— 见工单 05 的契约断言。
+        """
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="seconds")
+        return str(value)
+
     def create_kb(self, name: str, description: str = "") -> dict:
         kb_id = uuid.uuid4().hex[:12]
         try:
             with self._pool.connection() as conn:
                 row = conn.execute(
-                    "INSERT INTO kbs (kb_id, name, description) VALUES (?, ?, ?)"
-                    " RETURNING kb_id, name, description",
+                    # 占位符必须是 %s：psycopg3 不认 sqlite 风格的 ?，
+                    # 混用会让语句原样发给 Postgres 当运算符解析并报语法错误
+                    "INSERT INTO kbs (kb_id, name, description) VALUES (%s, %s, %s)"
+                    " RETURNING kb_id, name, description, created_at",
                     (kb_id, name, description),
                 ).fetchone()
-        except Exception as exc:  # unique_violation 等
-            raise KBError(f"知识库创建失败（重名？）: {name}") from exc
-        return {"kb_id": row[0], "name": row[1], "description": row[2]}
+        except Exception as exc:
+            raise as_domain_error(exc, f"知识库名已存在: {name}") from exc
+        return {
+            "kb_id": row[0],
+            "name": row[1],
+            "description": row[2],
+            "created_at": self._iso(row[3]),
+        }
 
     def list_kbs(self) -> List[dict]:
-        with self._pool.connection() as conn:
-            rows = conn.execute("SELECT kb_id, name, description FROM kbs ORDER BY created_at").fetchall()
-        return [{"kb_id": r[0], "name": r[1], "description": r[2]} for r in rows]
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT kb_id, name, description, created_at FROM kbs ORDER BY created_at"
+            ).fetchall()
+        return [
+            {"kb_id": r[0], "name": r[1], "description": r[2], "created_at": self._iso(r[3])}
+            for r in rows
+        ]
 
     def get_kb(self, kb_id: str) -> dict:
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             row = conn.execute(
-                "SELECT kb_id, name, description FROM kbs WHERE kb_id = %s", (kb_id,)
+                "SELECT kb_id, name, description, created_at FROM kbs WHERE kb_id = %s", (kb_id,)
             ).fetchone()
         if row is None:
             raise KBError(f"知识库不存在: {kb_id}")
-        return {"kb_id": row[0], "name": row[1], "description": row[2]}
+        return {
+            "kb_id": row[0],
+            "name": row[1],
+            "description": row[2],
+            "created_at": self._iso(row[3]),
+        }
 
     def kb_id_by_name(self, name: str) -> Optional[str]:
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT kb_id FROM kbs WHERE name = %s", (name,)).fetchone()
         return row[0] if row else None
 
     def delete_kb(self, kb_id: str) -> None:
         self.get_kb(kb_id)
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM documents WHERE kb_id = %s", (kb_id,))
             conn.execute("DELETE FROM kbs WHERE kb_id = %s", (kb_id,))
 
@@ -286,13 +396,17 @@ class PGKBRegistry(KBRegistry):
     ) -> dict:
         self.get_kb(kb_id)
         doc_id = new_doc_id()
-        with self._pool.connection() as conn:
-            row = conn.execute(
-                "INSERT INTO documents (doc_id, kb_id, filename, status, chunk_count, error)"
-                " VALUES (?, ?, ?, ?, ?, ?)"
-                " RETURNING doc_id, filename, status, chunk_count, error",
-                (doc_id, kb_id, filename, status, chunk_count, error),
-            ).fetchone()
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    "INSERT INTO documents (doc_id, kb_id, filename, status, chunk_count, error)"
+                    " VALUES (%s, %s, %s, %s, %s, %s)"
+                    " RETURNING doc_id, filename, status, chunk_count, error, created_at, updated_at",
+                    (doc_id, kb_id, filename, status, chunk_count, error),
+                ).fetchone()
+        except Exception as exc:
+            # 文档重名不是冲突（同名文档允许共存），这里只可能是真故障
+            raise as_domain_error(exc, f"文档记录写入冲突: {filename}") from exc
         return {
             "doc_id": row[0],
             "kb_id": kb_id,
@@ -300,39 +414,64 @@ class PGKBRegistry(KBRegistry):
             "status": row[2],
             "chunk_count": row[3],
             "error": row[4],
+            "created_at": self._iso(row[5]),
+            "updated_at": self._iso(row[6]),
         }
 
     def list_documents(self, kb_id: str) -> List[dict]:
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
-                "SELECT doc_id, filename, status, chunk_count, error FROM documents"
-                " WHERE kb_id = %s ORDER BY created_at",
+                "SELECT doc_id, filename, status, chunk_count, error, created_at, updated_at"
+                " FROM documents WHERE kb_id = %s ORDER BY created_at",
                 (kb_id,),
             ).fetchall()
-        return [
-            {"doc_id": r[0], "kb_id": kb_id, "filename": r[1], "status": r[2], "chunk_count": r[3], "error": r[4]}
-            for r in rows
-        ]
+        return [self._document_row(kb_id, r) for r in rows]
 
     def get_document(self, kb_id: str, doc_id: str) -> dict:
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             row = conn.execute(
-                "SELECT doc_id, filename, status, chunk_count, error FROM documents"
-                " WHERE kb_id = %s AND doc_id = %s",
+                "SELECT doc_id, filename, status, chunk_count, error, created_at, updated_at"
+                " FROM documents WHERE kb_id = %s AND doc_id = %s",
                 (kb_id, doc_id),
             ).fetchone()
         if row is None:
             raise KBError(f"文档不存在: {doc_id}")
-        return {"doc_id": row[0], "kb_id": kb_id, "filename": row[1], "status": row[2], "chunk_count": row[3], "error": row[4]}
+        return self._document_row(kb_id, row)
+
+    @staticmethod
+    def _document_row(kb_id: str, r) -> dict:
+        return {
+            "doc_id": r[0],
+            "kb_id": kb_id,
+            "filename": r[1],
+            "status": r[2],
+            "chunk_count": r[3],
+            "error": r[4],
+            "created_at": PGKBRegistry._iso(r[5]),
+            "updated_at": PGKBRegistry._iso(r[6]),
+        }
 
     def delete_document(self, kb_id: str, doc_id: str) -> None:
         self.get_document(kb_id, doc_id)
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM documents WHERE kb_id = %s AND doc_id = %s", (kb_id, doc_id))
 
     def delete_documents_of_kb(self, kb_id: str) -> None:
-        with self._pool.connection() as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM documents WHERE kb_id = %s", (kb_id,))
+
+    def update_document(
+        self, kb_id: str, doc_id: str, status: str, chunk_count: Optional[int] = None, error: str = ""
+    ) -> dict:
+        doc = self.get_document(kb_id, doc_id)
+        count = doc["chunk_count"] if chunk_count is None else chunk_count
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE documents SET status = %s, chunk_count = %s, error = %s, updated_at = now()"
+                " WHERE kb_id = %s AND doc_id = %s",
+                (status, count, error, kb_id, doc_id),
+            )
+        return self.get_document(kb_id, doc_id)
 
 
 _registry: Optional[KBRegistry] = None

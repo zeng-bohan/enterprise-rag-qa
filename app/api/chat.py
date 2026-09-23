@@ -11,12 +11,13 @@ v0.6 新增：
 import json
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.core.auth import require_api_key
-from app.core.metrics import REQUESTS
+from app.core.metrics import counted
 from app.api.deps import pipeline
+from app.api.errors import backend_errors
 from app.schemas import ChatRequest, ChatResponse
 
 router = APIRouter(prefix="/v1", tags=["chat"], dependencies=[Depends(require_api_key)])
@@ -24,14 +25,10 @@ router = APIRouter(prefix="/v1", tags=["chat"], dependencies=[Depends(require_ap
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    try:
+    with counted():
         result = await pipeline.aask(
             req.question, kb_id=req.kb_id, history=[m.model_dump() for m in req.history] if req.history else None
         )
-    except Exception:
-        REQUESTS.labels(status="error").inc()
-        raise
-    REQUESTS.labels(status="ok").inc()
     return result
 
 
@@ -48,16 +45,19 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
     """
 
     async def gen() -> AsyncIterator[str]:
-        try:
-            async for event in pipeline.astream(
-                req.question,
-                kb_id=req.kb_id,
-                history=[m.model_dump() for m in req.history] if req.history else None,
-            ):
-                yield _sse(event)
-            REQUESTS.labels(status="ok").inc()
-        except Exception:
-            REQUESTS.labels(status="error").inc()
-            yield _sse({"event": "error", "data": {"message": "internal error"}})
+        with counted(), backend_errors():
+            try:
+                async for event in pipeline.astream(
+                    req.question,
+                    kb_id=req.kb_id,
+                    history=[m.model_dump() for m in req.history] if req.history else None,
+                ):
+                    yield _sse(event)
+            except HTTPException as exc:
+                # 后端故障已被翻译成 503，但流已经开跑、状态码发不出去了，
+                # 只能把这个信息降级成一个 error 事件（工单 19 会把事件协议补全）
+                yield _sse({"event": "error", "data": {"message": exc.detail}})
+            except Exception:
+                yield _sse({"event": "error", "data": {"message": "internal error"}})
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})

@@ -13,19 +13,29 @@ The service is **API-first by design**: every capability ships as a REST endpoin
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-89%20passing%20offline-2EA043?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-93%20offline%20%2B%2034%20backend%20contract-2EA043?style=flat-square)
 
 ## Results at a glance
 
 Measured with the bundled evaluation suite — methodology and full reports in [Tests & evaluation](#tests--evaluation).
 
+> **Evaluation methodology is under revision.** The numbers below are real measurements
+> of the shipped pipeline, but an audit of how the evaluation set is constructed surfaced
+> three limitations that will change how they are reported (confidence intervals, stratified
+> sampling, a non-DeepSeek judge model, and a refusal-rate baseline). Tracking: tickets 21–28
+> in the remediation plan. Two facts worth stating up front, both recomputed from the files
+> in `data/qa_set/`: the 334 questions cover **80 distinct gold chunks** (≈4.2 questions per
+> chunk, so the effective sample is ~80 correlated trials rather than 334 independent ones),
+> and the n=100 RAGAS subset is `qa_set[:100]` — a head slice, which happens to come from a
+> **single source document**.
+
 | Metric | Result |
 | --- | --- |
-| Recall@1 / Recall@3 / Recall@5 (n=334, hybrid) | **87.4%** / **97.9%** / **98.2%** |
-| Faithfulness (RAGAS, n=100) | **94.1%** |
+| Recall@1 / Recall@3 / Recall@5 (n=334 rows / 80 unique gold chunks, hybrid) | **87.4%** / **97.9%** / **98.2%** |
+| Faithfulness (RAGAS, n=100 head slice, self-judged) | **94.1%** |
 | Answer relevancy (RAGAS) | **88.7%** |
 | Hallucination rate (RAGAS) | **5.9%** |
-| P95 latency (after the async pipeline work) | 32s → **10s** |
+| P95 latency (after the async pipeline work) | 32s → **10s** — tail latency only; throughput was ~0.9 QPS in both runs, and the "after" figure is measured post-warmup. Not yet published as a committed report (ticket 26). |
 
 ## Features
 
@@ -50,7 +60,7 @@ Measured with the bundled evaluation suite — methodology and full reports in [
 - Prometheus metrics (`/metrics`), per-stage latency histograms, cache/LLM counters.
 - Redis caches degrade gracefully when unavailable; local mode needs no Redis at all.
 - Optional API-key auth (`X-API-Key`) on all `/v1` routes; health and metrics stay open.
-- Measured on the project evaluation set: Recall@1 **87.4%**, Faithfulness **94.1%**, and P95 latency improved from **32s** to **10s** after the asynchronous pipeline work.
+- Measured on the project evaluation set: Recall@1 **87.4%**, Faithfulness **94.1%**, and P95 latency improved from **32s** to **10s** after the asynchronous pipeline work. These predate the evaluation-methodology revision described in [Tests & evaluation](#tests--evaluation).
 
 ## Architecture
 
@@ -196,16 +206,29 @@ docker-compose.yml
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests -q        # 89 passed
+pytest tests -q                          # everything (93 offline + 34 backend contract)
+pytest tests -m "not contract" -q        # offline only: no PostgreSQL, no Redis, no models
+pytest tests -m contract -q              # needs `docker compose up -d`
 ```
+
+The suite is split in two on purpose. The offline half is what makes the project pleasant
+to hack on — anyone can clone it and run everything in seconds. But it stubs the storage
+layer, which means it cannot see SQL: `PGvectorStore`, `ChromaStore`, `PGKBRegistry` and
+`BGEEmbeddings` were never referenced by a single offline test, and a PostgreSQL-only bug
+(wrong parameter placeholders in the registry) survived to `main` with CI green. The
+contract half closes exactly that gap: both backends run **the same assertions** — KB/doc
+lifecycle, cascade deletes, cross-KB isolation, and cross-backend score-scale agreement
+around the refusal threshold. In CI a missing PostgreSQL is a **failure**, not a skip.
 
 **Retrieval evaluation.** `scripts/gen_qa_set.py` builds a chunk-grounded QA set (each question is answerable only from a single chunk; 10% human spot-check), and `scripts/eval_recall.py` measures Recall@k for the hybrid retriever against a vector-only baseline:
 
-- Recall@1 **87.4%** / Recall@3 **97.9%** / Recall@5 **98.2%** (n=334, hybrid) — full report in `data/qa_set/recall_report.json`
+- Recall@1 **87.4%** / Recall@3 **97.9%** / Recall@5 **98.2%** (n=334 rows over 80 unique gold chunks, hybrid) — full report in `data/qa_set/recall_report.json`
 
 **Generation quality.** `scripts/eval_ragas.py` scores generated answers with RAGAS:
 
-- Faithfulness **94.1%**, answer relevancy **88.7%**, hallucination rate **5.9%** (n=100) — full report in `data/qa_set/ragas_report.json`
+- Faithfulness **94.1%**, answer relevancy **88.7%**, hallucination rate **5.9%** (n=100 head slice of the QA set, judged by the same model family that generates the answers) — full report in `data/qa_set/ragas_report.json`
+
+Both suites above are being reworked (stratified sampling, chunk-level de-duplication with confidence intervals, an independent judge model, a negative-query set for refusal rate, and committed bench reports); see tickets 21–28. Until then treat the numbers above as *measured but not yet methodology-clean*.
 
 ## Design decisions
 

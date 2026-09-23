@@ -8,8 +8,14 @@
 实现要点：
 - 中文无天然词边界，用 jieba 精确模式分词；
 - rank_bm25.BM25Okapi 默认参数（k1=1.5, b=0.75）对中文制度文档效果稳定；
-- 索引在进程启动时从向量库全量构建，入库脚本执行后需重启服务才会刷新
-  （v0.3 换 PGvector 时顺带支持增量更新）。
+- 索引由 HybridRetriever 按知识库惰性构建，文档增删后 invalidate(kb_id)，
+  下次查询时全量重建（不是启动时一次性构建，也没有增量更新）。
+
+已知规模瓶颈（工单 11 处理，这里先把话说明白，避免注释和实现继续不符）：
+- 每次 invalidate 之后，第一个请求要在在线线程池里把该 KB 全部 chunk 拉回内存、
+  逐条 jieba 分词、重建 BM25Okapi —— 十万 chunk 级 KB 上就是秒级到十秒级的 P99 尖刺；
+- BM25Okapi.get_scores 是纯 Python 实现，每次查询线性遍历整个语料，本身即 O(N)。
+落点是 PG 侧真倒排（tsvector + GIN，分词结果入库），届时「增量更新」才真正成立。
 """
 from typing import List, Optional, Tuple
 

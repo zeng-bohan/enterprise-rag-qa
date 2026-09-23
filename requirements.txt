@@ -10,7 +10,10 @@ langchain-community>=0.4
 langchain-chroma>=0.2
 langchain-text-splitters>=1.0
 
-# 向量库（第 2 周迁移到 PGvector 后移除 chromadb）
+# 向量库：双后端并存（工单 05 起两后端跑同一套契约测试）
+# - pgvector：生产路径（docker compose 起）
+# - chroma：零依赖本地路径，长期保留，不是迁移期临时产物
+#   （原注释写「第 2 周迁移到 PGvector 后移除 chromadb」，与 v0.6 的实际定位相反）
 # 版本下限放开，交给 pip 与 langchain-chroma 协商兼容版本
 chromadb>=0.5.2
 

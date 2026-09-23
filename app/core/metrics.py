@@ -13,6 +13,8 @@
 可直接被 Prometheus 抓取、Grafana 展示）。
 """
 import time
+from contextlib import contextmanager
+from typing import Iterator
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -36,3 +38,40 @@ def llm_start() -> float:
 
 def llm_done(t0: float) -> None:
     LLM_LATENCY.observe(time.perf_counter() - t0)
+
+
+@contextmanager
+def llm_timer() -> Iterator[None]:
+    """一次 LLM 调用的计数 + 耗时，同步 / 异步两条路径共用同一个口径。
+
+    用 try/finally 而非顺序调用：LLM 抛错（超时 / 限流）时耗时仍要落进直方图，
+    否则面板上看到的是「LLM 调用次数变少」而不是「LLM 在失败」。
+    """
+    t0 = llm_start()
+    try:
+        yield
+    finally:
+        llm_done(t0)
+
+
+@contextmanager
+def counted() -> Iterator[None]:
+    """端点级请求计数：正常结束记 ok，异常记 error 后原样抛出。
+
+    收敛前先补一句历史：原本只有 /v1/chat 计数，/v1/retrieval-test 完全不进
+    rag_requests_total，两个端点的 QPS 在同一块面板上不可比。
+    """
+    try:
+        yield
+    except Exception:
+        REQUESTS.labels(status="error").inc()
+        raise
+    REQUESTS.labels(status="ok").inc()
+
+
+def cache_hit(kind: str) -> None:
+    CACHE_HITS.labels(kind=kind).inc()
+
+
+def cache_miss(kind: str) -> None:
+    CACHE_MISSES.labels(kind=kind).inc()
