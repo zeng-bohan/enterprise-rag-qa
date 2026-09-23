@@ -49,10 +49,23 @@ def rrf_fuse(
 
 
 class HybridRetriever:
-    def __init__(self, store: "ChromaStore | PGvectorStore") -> None:
+    def __init__(
+        self,
+        store: "ChromaStore | PGvectorStore",
+        rewriter: Optional[QueryRewriter] = None,
+        reranker: Optional[CrossEncoderReranker] = None,
+    ) -> None:
+        """rewriter / reranker 可注入（与 pipeline.py 的约定一致）。
+
+        为什么这是必须的而不只是"更干净"：两者默认实现都要碰外部世界——
+        QueryRewriter 构造时建 LLM 客户端，CrossEncoderReranker 构造时去 HuggingFace
+        拉 ~1.1GB 模型。测试想替换其中一个，就得先成功构造另一个，于是：
+        离线用例在没有凭据的机器上直接抛 Missing credentials，或整轮挂死在下载上。
+        两个都由调用方给定时，构造过程不触碰任何网络。
+        """
         self._store = store
-        self._rewriter = QueryRewriter()
-        self._reranker = CrossEncoderReranker()
+        self._rewriter = rewriter if rewriter is not None else QueryRewriter()
+        self._reranker = reranker if reranker is not None else CrossEncoderReranker()
         # 每知识库一个 BM25 索引，惰性构建；文档增删后 invalidate(kb_id)
         self._bm25_cache: Dict[str, BM25Index] = {}
 
