@@ -1,0 +1,146 @@
+{
+  "conditions": {
+    "rows": 50000,
+    "dim": 512,
+    "knowledge_bases": 8,
+    "queries": 100,
+    "kb_filter_selectivity": 0.125,
+    "hnsw_m": 16,
+    "hnsw_ef_construction": 64,
+    "index_build_seconds": 82.2,
+    "pg_settings": "127.0.0.1:5432/rag_kb",
+    "note": "单机 Docker 容器内测量；shared_buffers 为镜像默认值。"
+  },
+  "results": [
+    {
+      "mode": "seq_scan",
+      "kb_filtered": false,
+      "ef_search": null,
+      "p50_ms": 107.44,
+      "p95_ms": 116.9,
+      "recall@10": 1.0
+    },
+    {
+      "mode": "seq_scan_filtered",
+      "kb_filtered": true,
+      "ef_search": null,
+      "p50_ms": 17.07,
+      "p95_ms": 18.48,
+      "recall@10": 1.0
+    },
+    {
+      "mode": "hnsw",
+      "kb_filtered": false,
+      "ef_search": 40,
+      "p50_ms": 2.14,
+      "p95_ms": 2.83,
+      "recall@10": 0.083
+    },
+    {
+      "mode": "hnsw_filtered",
+      "kb_filtered": true,
+      "ef_search": 40,
+      "p50_ms": 14.35,
+      "p95_ms": 16.5,
+      "recall@10": 1.0
+    },
+    {
+      "mode": "hnsw",
+      "kb_filtered": false,
+      "ef_search": 100,
+      "p50_ms": 3.47,
+      "p95_ms": 6.97,
+      "recall@10": 0.177
+    },
+    {
+      "mode": "hnsw_filtered",
+      "kb_filtered": true,
+      "ef_search": 100,
+      "p50_ms": 14.75,
+      "p95_ms": 17.62,
+      "recall@10": 1.0
+    },
+    {
+      "mode": "hnsw",
+      "kb_filtered": false,
+      "ef_search": 200,
+      "p50_ms": 5.29,
+      "p95_ms": 8.71,
+      "recall@10": 0.295
+    },
+    {
+      "mode": "hnsw_filtered",
+      "kb_filtered": true,
+      "ef_search": 200,
+      "p50_ms": 5.34,
+      "p95_ms": 6.71,
+      "recall@10": 0.286
+    },
+    {
+      "mode": "hnsw",
+      "kb_filtered": false,
+      "ef_search": 400,
+      "p50_ms": 8.66,
+      "p95_ms": 10.42,
+      "recall@10": 0.471
+    },
+    {
+      "mode": "hnsw_filtered",
+      "kb_filtered": true,
+      "ef_search": 400,
+      "p50_ms": 8.69,
+      "p95_ms": 10.34,
+      "recall@10": 0.445
+    },
+    {
+      "mode": "hnsw",
+      "kb_filtered": false,
+      "ef_search": 800,
+      "p50_ms": 13.87,
+      "p95_ms": 15.55,
+      "recall@10": 0.682
+    },
+    {
+      "mode": "hnsw_filtered",
+      "kb_filtered": true,
+      "ef_search": 800,
+      "p50_ms": 14.2,
+      "p95_ms": 16.04,
+      "recall@10": 0.667
+    },
+    {
+      "mode": "hnsw",
+      "kb_filtered": false,
+      "ef_search": 1000,
+      "p50_ms": 16.66,
+      "p95_ms": 19.44,
+      "recall@10": 0.764
+    },
+    {
+      "mode": "hnsw_filtered",
+      "kb_filtered": true,
+      "ef_search": 1000,
+      "p50_ms": 18.3,
+      "p95_ms": 24.02,
+      "recall@10": 0.729
+    }
+  ],
+  "explain_sample": [
+    "Limit  (cost=689.52..801.43 rows=10 width=19) (actual time=22.267..22.491 rows=10 loops=1)",
+    "  Buffers: shared hit=22619 read=602",
+    "  InitPlan 1 (returns $0)",
+    "    ->  Limit  (cost=0.00..0.02 rows=1 width=18) (actual time=0.003..0.004 rows=1 loops=1)",
+    "          Buffers: shared hit=1",
+    "          ->  Seq Scan on chunks chunks_1  (cost=0.00..1124.00 rows=50000 width=18) (actual time=0.003..0.004 rows=1 loops=1)",
+    "                Buffers: shared hit=1",
+    "  ->  Index Scan using idx_chunks_embedding on chunks  (cost=689.50..70183.52 rows=6210 width=19) (actual time=22.265..22.487 rows=10 loops=1)",
+    "        Order By: (embedding <=> ($0)::vector)",
+    "        Filter: (kb_id = 'bench__0'::text)",
+    "        Rows Removed by Filter: 68",
+    "        Buffers: shared hit=22619 read=602",
+    "Planning:",
+    "  Buffers: shared hit=1",
+    "Planning Time: 0.082 ms",
+    "Execution Time: 22.509 ms"
+  ]
+}

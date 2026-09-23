@@ -114,6 +114,14 @@ class KBRegistry:
     def delete_documents_of_kb(self, kb_id: str) -> None:
         raise NotImplementedError
 
+    def document_counts(self) -> dict:
+        """一次取回 {kb_id: 文档数}。
+
+        存在的理由（工单 17）：GET /v1/kbs 以前对每个知识库发两次查询
+        （list_documents + store.count），N 个库就是 2N+1 次往返。
+        """
+        raise NotImplementedError
+
 
 class SQLiteKBRegistry(KBRegistry):
     """本地模式：单文件 SQLite（stdlib，无新依赖）。"""
@@ -242,6 +250,14 @@ class SQLiteKBRegistry(KBRegistry):
     def delete_documents_of_kb(self, kb_id: str) -> None:
         self._conn.execute("DELETE FROM documents WHERE kb_id = ?", (kb_id,))
         self._conn.commit()
+
+    def document_counts(self) -> dict:
+        # 必须给 count(*) 起别名：sqlite3.Row 用列名索引，而无列名的聚合表达式取不到
+        # （写成 r["1"] 会 IndexError）。这条只有真正执行过才会暴露。
+        rows = self._conn.execute(
+            "SELECT kb_id, count(*) AS n FROM documents GROUP BY kb_id"
+        ).fetchall()
+        return {r["kb_id"]: r["n"] for r in rows}
 
     def update_document(
         self, kb_id: str, doc_id: str, status: str, chunk_count: Optional[int] = None, error: str = ""
@@ -459,6 +475,13 @@ class PGKBRegistry(KBRegistry):
     def delete_documents_of_kb(self, kb_id: str) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM documents WHERE kb_id = %s", (kb_id,))
+
+    def document_counts(self) -> dict:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT kb_id, count(*) FROM documents GROUP BY kb_id"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     def update_document(
         self, kb_id: str, doc_id: str, status: str, chunk_count: Optional[int] = None, error: str = ""

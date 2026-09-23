@@ -14,6 +14,7 @@ v0.6 多知识库语义：
 - v2 引入 BM25 混合 + 重排：字面匹配与语义匹配互补，实测排序修正（见 git 历史对比）；
 - v3 多知识库：单库 BM25 全局索引 → 按 kb 惰性索引 + 失效通知。
 """
+import asyncio
 from typing import Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
@@ -48,10 +49,23 @@ def rrf_fuse(
 
 
 class HybridRetriever:
-    def __init__(self, store: "ChromaStore | PGvectorStore") -> None:
+    def __init__(
+        self,
+        store: "ChromaStore | PGvectorStore",
+        rewriter: Optional[QueryRewriter] = None,
+        reranker: Optional[CrossEncoderReranker] = None,
+    ) -> None:
+        """rewriter / reranker 可注入（与 pipeline.py 的约定一致）。
+
+        为什么这是必须的而不只是"更干净"：两者默认实现都要碰外部世界——
+        QueryRewriter 构造时建 LLM 客户端，CrossEncoderReranker 构造时去 HuggingFace
+        拉 ~1.1GB 模型。测试想替换其中一个，就得先成功构造另一个，于是：
+        离线用例在没有凭据的机器上直接抛 Missing credentials，或整轮挂死在下载上。
+        两个都由调用方给定时，构造过程不触碰任何网络。
+        """
         self._store = store
-        self._rewriter = QueryRewriter()
-        self._reranker = CrossEncoderReranker()
+        self._rewriter = rewriter if rewriter is not None else QueryRewriter()
+        self._reranker = reranker if reranker is not None else CrossEncoderReranker()
         # 每知识库一个 BM25 索引，惰性构建；文档增删后 invalidate(kb_id)
         self._bm25_cache: Dict[str, BM25Index] = {}
 
@@ -112,6 +126,14 @@ class HybridRetriever:
         vec_hits = self._store.search(query, RECALL_K, kb_id=kb)
         return self._finalize(query, bm25_hits, vec_hits, k, vec_floor)
 
+    def _bm25_search(self, kb: str, kw_query: str) -> List[Tuple[Document, float]]:
+        """建索引（若缺）+ 检索，整体留在 CPU 线程池里执行。
+
+        以前 `_bm25_for(kb)` 在事件循环线程上调用，于是"文档变更后第一个请求要
+        全量重建 BM25 索引"这件重活会直接卡住事件循环（不只是卡住那个线程）。
+        """
+        return self._bm25_for(kb).search(kw_query, RECALL_K)
+
     async def aretrieve(
         self,
         query: str,
@@ -120,12 +142,24 @@ class HybridRetriever:
         threshold: Optional[float] = None,
     ) -> List[Tuple[Document, float]]:
         """异步版 retrieve（v0.5）：改写 LLM 用 await；BM25/向量/重排是 CPU 计算，
-        丢进专用有界线程池（app.core.executor），避免并发时线程超卖抢核。"""
+        丢进专用有界线程池（app.core.executor），避免并发时线程超卖抢核。
+
+        工单 15：改写 + BM25 这一路，和向量检索那一路，并行跑。
+        以前是串行的：`await arewrite()` → BM25 → 向量。但改写结果**只喂 BM25**
+        （kw_query），向量检索用的是原问题，两者之间没有依赖 —— 串行等于让向量
+        检索白等一次 LLM 往返（实测约 1s）。gather 之后这条路径的墙钟时间从
+        「改写 + 两路检索」降成「max(改写 + BM25, 向量)」。
+        """
         kb = kb_id or settings.default_kb
         k = top_k or settings.retrieval_top_k
         vec_floor = threshold if threshold is not None else settings.score_threshold
 
-        kw_query = await self._rewriter.arewrite(query)
-        bm25_hits = await run_cpu(self._bm25_for(kb).search, kw_query, RECALL_K)
-        vec_hits = await run_cpu(self._store.search, query, RECALL_K, kb)
+        async def _keyword_path() -> List[Tuple[Document, float]]:
+            kw_query = await self._rewriter.arewrite(query)
+            return await run_cpu(self._bm25_search, kb, kw_query)
+
+        bm25_hits, vec_hits = await asyncio.gather(
+            _keyword_path(),
+            run_cpu(self._store.search, query, RECALL_K, kb),
+        )
         return await run_cpu(self._finalize, query, bm25_hits, vec_hits, k, vec_floor)
