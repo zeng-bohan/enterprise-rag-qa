@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
 
+    # ---- 评测裁判（工单 23：裁判必须与生成者不同源）----
+    # 为什么单独配一组而不是复用 deepseek_*：Faithfulness 由 LLM 判定，如果判定
+    # 和生成为同一模型家族，指标会带上自偏好偏差 —— 这正是旧评测报告的缺陷之一。
+    # 不声明这三个字段的话，pydantic 的 extra="ignore" 会把 .env 里的同名键静默丢掉。
+    judge_api_key: str = ""
+    judge_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    judge_model: str = "glm-4-flash-250414"
+    # 思考型模型（如 glm-4.5-flash）会把预算花在 reasoning_content 上，
+    # 导致 content 为空、判定结果静默变成垃圾值。裁判因此强制一个较大的下限。
+    judge_max_tokens: int = 1024
+
     # ---- Embedding（本地 BGE，fastembed / ONNX Runtime）----
     embed_model: str = "BAAI/bge-small-zh-v1.5"
     embed_dim: int = 512
