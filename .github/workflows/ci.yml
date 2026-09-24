@@ -44,9 +44,19 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U ragkb -d rag_kb"
           --health-interval 5s --health-timeout 3s --health-retries 10
+      # 异步摄取的契约用例（工单 12）要真 broker：arq 的队列键布局、zset 深度这些
+      # 只有在真实 Redis 上才测得到 —— 桩能全绿而真链路 WRONGTYPE 的事故刚发生过
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       VECTOR_BACKEND: pgvector
       POSTGRES_DSN: postgresql://ragkb:ragkb123@127.0.0.1:5432/rag_kb
+      REDIS_URL: redis://127.0.0.1:6379/0
       # 关键：CI 里 Postgres 连不上就是 job 失败，不允许降级成 skip。
       # 少了这个开关，「契约测试通过」可以由「全部跳过」得到，门禁形同虚设。
       RAG_CONTRACT_STRICT: "1"

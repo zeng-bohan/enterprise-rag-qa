@@ -114,6 +114,16 @@ class KBRegistry:
     def delete_documents_of_kb(self, kb_id: str) -> None:
         raise NotImplementedError
 
+    def shares_pool_with(self, store) -> bool:
+        """能否与该向量库共用一条连接做跨表事务。
+
+        基类默认 False：只有"注册中心与向量库同在一个 PostgreSQL"才可能，
+        也就是 PGKBRegistry 会覆写它。写成显式接口而不是让调用方 getattr 试探，
+        是因为本地模式（Chroma + SQLite）根本不存在可共享的连接对象 ——
+        试探式写法曾在这里抛 AttributeError，把一次正常上传变成 500。
+        """
+        return False
+
     def document_counts(self) -> dict:
         """一次取回 {kb_id: 文档数}。
 
@@ -277,20 +287,12 @@ class PGKBRegistry(KBRegistry):
     """生产模式：PostgreSQL（与 chunks 同库，连接池复用 store 的配置）。"""
 
     def __init__(self, dsn: str) -> None:
-        from psycopg_pool import ConnectionPool
+        # 与 PGvectorStore 共用同一个池（工单 10）：连接数不再随模块叠加，
+        # 更重要的是 chunks 与 documents 能落进同一个事务（工单 18）。
+        from app.core.pg_pool import get_pool
 
-        self._pool = ConnectionPool(
-            dsn,
-            min_size=1,
-            max_size=4,
-            kwargs={"autocommit": True},
-            # timeout：PG 挂掉时快速失败（默认 30s 会让每个请求都卡在 checkout 上，
-            # 表现为整站超时而不是一个明确的 503）
-            timeout=10,
-            # 复用的连接可能已被服务端回收（idle timeout / 重启），取回时先探一次
-            check=ConnectionPool.check_connection,
-            open=True,
-        )
+        self._dsn = dsn
+        self._pool = get_pool(dsn, max_size=8, application_name="rag-app")
         self._init_schema()
 
     @contextmanager
@@ -466,6 +468,19 @@ class PGKBRegistry(KBRegistry):
             "created_at": PGKBRegistry._iso(r[5]),
             "updated_at": PGKBRegistry._iso(r[6]),
         }
+
+    def update_document_on(self, conn, kb_id: str, doc_id: str, status: str,
+                           chunk_count: int) -> None:
+        """在**给定连接**上推进状态，供外层与 chunks 写入共用一个事务（工单 18）。"""
+        conn.execute(
+            "UPDATE documents SET status = %s, chunk_count = %s, error = '', updated_at = now()"
+            " WHERE kb_id = %s AND doc_id = %s",
+            (status, chunk_count, kb_id, doc_id),
+        )
+
+    def shares_pool_with(self, store) -> bool:
+        """能否与向量库共用一条连接做跨表事务（只有双 PG 后端可以）。"""
+        return getattr(store, "_pool", None) is self._pool
 
     def delete_document(self, kb_id: str, doc_id: str) -> None:
         self.get_document(kb_id, doc_id)

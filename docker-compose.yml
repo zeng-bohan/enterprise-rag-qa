@@ -34,6 +34,33 @@ services:
       timeout: 3s
       retries: 10
 
+  # 摄取 worker（工单 12）：把文档索引从 HTTP 进程里挪出来。
+  # 没有引入新服务——用的就是上面那个 Redis。
+  # 镜像与 API 服务共用同一份代码（bind mount）；正式的 Dockerfile 在工单 35 补，
+  # 在那之前 worker 首次启动会装一次依赖，所以给它 longer start_period。
+  worker:
+    image: python:3.12-slim
+    container_name: ragkb-worker
+    working_dir: /app
+    command: >
+      sh -c "pip install -q -r requirements.txt && python -m arq app.worker.WorkerSettings"
+    volumes:
+      - ./:/app
+    environment:
+      VECTOR_BACKEND: pgvector
+      POSTGRES_DSN: postgresql://ragkb:ragkb123@postgres:5432/rag_kb
+      REDIS_URL: redis://redis:6379/0
+      CHROMA_DIR: /app/data/chroma
+      # worker 只跑摄取，模式对它无意义，显式写出来是为了让"这套部署是异步摄取"
+      # 在 compose 里一眼可见（API 侧要同时设 INGEST_MODE=queue 才会入队）
+      INGEST_MODE: queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
