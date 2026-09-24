@@ -413,9 +413,16 @@ def test_async_ingestion_round_trip_against_real_broker(tmp_path, monkeypatch, r
     from app.rag.ingest import ingest_document as _  # noqa: F401 - 确认可导入
     from app.worker import ingest_document as worker_task
 
-    from .conftest import _require_pg_or_skip, build_registry, build_store, _safe_collection
+    from .conftest import (
+        _require_pg_or_skip,
+        _require_redis_or_skip,
+        _safe_collection,
+        build_registry,
+        build_store,
+    )
 
     _require_pg_or_skip()
+    _require_redis_or_skip()
     store = build_store("pg", tmp_path, monkeypatch, collection=_safe_collection(request.node.name))
     registry = build_registry("pg", tmp_path, monkeypatch)
     kb_id = registry.create_kb(f"e2e-{uuid.uuid4().hex[:8]}")["kb_id"]
@@ -440,6 +447,21 @@ def test_async_ingestion_round_trip_against_real_broker(tmp_path, monkeypatch, r
 
     result = _run(worker_task({}, payload))
     assert json.dumps(result)  # worker 返回可序列化，arq 才会接受
+
+    # 收尾清掉本用例写进 broker 的任务记录，别在共享 Redis 里留垃圾
+    def _flush_broker():
+        import redis as redis_lib
+
+        try:
+            client = redis_lib.Redis.from_url(settings.redis_url)
+            client.delete(INGEST_QUEUE)
+            for key in client.scan_iter("arq:job:*"):
+                client.delete(key)
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    request.addfinalizer(_flush_broker)
 
     record = registry.get_document(kb_id, doc_id)
     assert record["status"] == "indexed" and record["chunk_count"] >= 1

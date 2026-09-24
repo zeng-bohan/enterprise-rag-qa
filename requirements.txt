@@ -37,5 +37,9 @@ psycopg[binary,pool]>=3.2
 pgvector>=0.3
 redis>=5.0
 
+# 异步摄取队列（工单 12）：worker 进程与 API 之间的任务总线
+# 注意：arq 依赖上面那个 redis 客户端，不引入新的基础设施服务
+arq>=0.26
+
 # 监控（v0.5）：Prometheus 指标暴露（/metrics 端点）
 prometheus-client>=0.20
