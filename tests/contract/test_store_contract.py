@@ -16,6 +16,8 @@ from langchain_core.documents import Document
 from app.config import settings
 from app.rag.vector_store import chunk_uid, content_hash
 
+from .conftest import _safe_collection
+
 pytestmark = pytest.mark.contract
 
 SHARED = "共享条款：本制度自发布之日起施行。"
@@ -273,3 +275,186 @@ def test_manage_api_against_real_postgres(tmp_path, monkeypatch):
 
     # 恢复之后必须立刻可用——否则上面的 503 只是把连接池弄坏了，测的不是翻译逻辑
     assert client.get("/v1/kbs").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 工单 18：摄取写入的原子性（两个后端共用一套断言）
+# ---------------------------------------------------------------------------
+def _ingest_pair(backend, tmp_path, monkeypatch, request):
+    """返回 (store, registry, kb_id)，两后端各自真实构造。
+
+    名字必须带用例标识：这个 helper 直接用 build_* 构造，绕过了 registry/store
+    fixture 的快照清理，所以固定名字会让同 session 里第二个用例撞
+    kbs_name_key 唯一约束（第一次跑就是这样红的）。cleanup 注册在 request.addfinalizer
+    上，比依赖 fixture  teardown 更稳。
+    """
+    import uuid
+
+    from .conftest import build_registry, build_store
+
+    store = build_store(backend, tmp_path, monkeypatch, collection=_safe_collection(request.node.name))
+    registry = build_registry(backend, tmp_path, monkeypatch)
+    kb_name = f"ingest-{backend}-{uuid.uuid4().hex[:8]}"
+    kb_id = registry.create_kb(kb_name)["kb_id"]
+
+    def _cleanup():
+        try:
+            store.delete_by_kb(kb_id)
+            registry.delete_kb(kb_id)
+        except Exception:  # noqa: BLE001 - 清理失败不该改写用例结论
+            pass
+
+    request.addfinalizer(_cleanup)
+    return store, registry, kb_id
+
+
+def test_ingest_is_all_or_nothing(backend, tmp_path, monkeypatch, request):
+    """一次成功摄取的可见结果：状态 indexed、chunk 数与实际写入一致。
+
+    断言的是**可观察结果**而不是"有没有 BEGIN"：双 PG 走真事务，
+    Chroma+SQLite 跨引擎没有事务、只能顺序写。两套实现共用这条断言，
+    才谈得上"平等支持"。
+    """
+    from pathlib import Path
+
+    from app.rag.ingest import ingest_document
+
+    store, registry, kb_id = _ingest_pair(backend, tmp_path, monkeypatch, request)
+    src = tmp_path / "制度.md"
+    src.write_text("# 制度\n第一条 年假十天。\n第二条 病假需证明。\n", encoding="utf-8")
+    doc_id = registry.add_document(kb_id, src.name, chunk_count=0, status="queued")["doc_id"]
+
+    record = ingest_document(store, registry, kb_id, doc_id, src)
+    assert record["status"] == "indexed"
+    assert record["chunk_count"] == store.count(kb_id=kb_id), "chunk_count 与实际写入不一致"
+    assert record["chunk_count"] >= 1
+
+
+def test_failed_ingest_leaves_no_partial_chunks(backend, tmp_path, monkeypatch, request):
+    """中途失败后不得留下"有 chunk 但状态没推进"或"状态 indexed 但零 chunk"的半态。"""
+    from app.rag import ingest as ingest_mod
+    from app.rag.ingest import ingest_document
+
+    store, registry, kb_id = _ingest_pair(backend, tmp_path, monkeypatch, request)
+    src = tmp_path / "坏文件.md"
+    src.write_text("# x\n内容一二三。\n", encoding="utf-8")
+    doc_id = registry.add_document(kb_id, src.name, chunk_count=0, status="queued")["doc_id"]
+
+    # 在"向量已算完、即将写入"的时刻注入失败
+    original = store.embed_for
+    def boom(docs):
+        raise RuntimeError("推理阶段炸了")
+    monkeypatch.setattr(store, "embed_for", boom)
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        ingest_document(store, registry, kb_id, doc_id, src)
+    monkeypatch.setattr(store, "embed_for", original)
+
+    assert store.count(kb_id=kb_id) == 0, "失败摄取留下了半截 chunk"
+    doc = registry.get_document(kb_id, doc_id)
+    assert doc["status"] == "queued", f"状态被半途推进了：{doc['status']}"
+    assert doc["chunk_count"] == 0
+
+
+def test_ingest_bumps_kb_version_for_cross_process_invalidation(backend, tmp_path, monkeypatch, request):
+    """工单 13：摄取必须让 kb 版本号前进，否则 worker 写完、API 进程不知道要重建索引。
+
+    这条只在有 Redis 时验证真实行为；没有 Redis 时退化为"信号发送不抛错"，
+    因为设计上共享存储不可用绝不该让写入失败。
+    """
+    from app.core.cache import get_cache
+    from app.core.kb_version import KBVersionTracker, bump_kb_version
+    from app.rag.ingest import ingest_document
+
+    store, registry, kb_id = _ingest_pair(backend, tmp_path, monkeypatch, request)
+    src = tmp_path / "版本.md"
+    src.write_text("# y\n第一条内容。\n第二条内容。\n", encoding="utf-8")
+    doc_id = registry.add_document(kb_id, src.name, chunk_count=0, status="queued")["doc_id"]
+
+    tracker = KBVersionTracker(poll_ttl=0.0)  # 关掉轮询缓存，逐次真读
+    before = tracker.current(kb_id)
+    bump_kb_version(kb_id)
+    after_bump = tracker.current(kb_id)
+
+    if get_cache().available:
+        assert after_bump == before + 1, "版本号没有前进，跨进程失效信号是断的"
+    else:
+        assert after_bump == before, "无 Redis 时不应凭空造出版本变化"
+
+    ingest_document(store, registry, kb_id, doc_id, src)
+    if get_cache().available:
+        assert tracker.current(kb_id) == after_bump + 1, "摄取本身没有发失效信号"
+
+
+@pytest.mark.contract
+def test_async_ingestion_round_trip_against_real_broker(tmp_path, monkeypatch, request):
+    """工单 12/13/18 的端到端：入队 → worker 事务写入 → 版本推进 → 可检索。
+
+    为什么单独有这条：queue 路径在离线套件里只能用假 broker 测（断言"入队被调用"），
+    而真正会出事的是与真 Redis / 真 arq 的接线 —— 第一版 `queue_depth()` 就是这么
+    踩到 arq 把队列存成 zset 而非 list，LLEN 直接抛 WRONGTYPE，而所有用桩的用例
+    都是绿的。这类问题只有连真中间件跑一遍才会暴露。
+
+    没有拉起常驻 worker 进程（那需要模型下载与一个事件循环外的生命周期），
+    而是直接 await worker 的任务函数：覆盖的是载荷解析、状态机推进、跨表事务与
+    失效信号，这些正是 worker 与 API 的全部接口面。
+    """
+    import json
+    import uuid
+
+    from app.core.kb_version import KBVersionTracker
+    from app.core.queue import (
+        INGEST_QUEUE,
+        JOB_INGEST_DOCUMENT,
+        enqueue_ingest,
+        ingest_job_payload,
+        queue_depth,
+    )
+    from app.rag.ingest import ingest_document as _  # noqa: F401 - 确认可导入
+    from app.worker import ingest_document as worker_task
+
+    from .conftest import _require_pg_or_skip, build_registry, build_store, _safe_collection
+
+    _require_pg_or_skip()
+    store = build_store("pg", tmp_path, monkeypatch, collection=_safe_collection(request.node.name))
+    registry = build_registry("pg", tmp_path, monkeypatch)
+    kb_id = registry.create_kb(f"e2e-{uuid.uuid4().hex[:8]}")["kb_id"]
+    request.addfinalizer(lambda: (store.delete_by_kb(kb_id), registry.delete_kb(kb_id)))
+
+    src = tmp_path / "制度.md"
+    src.write_text(
+        "# 制度\n第一条 年假十天。\n第二条 病假须提交证明。\n第三条 公积金提取须连续缴存三个月。\n",
+        encoding="utf-8",
+    )
+    doc_id = registry.add_document(kb_id, src.name, chunk_count=0, status="queued")["doc_id"]
+
+    tracker = KBVersionTracker(poll_ttl=0.0)
+    version_before = tracker.current(kb_id)
+    assert registry.get_document(kb_id, doc_id)["status"] == "queued"
+
+    payload = ingest_job_payload(kb_id, doc_id, str(src), src.name)
+    job_id = _run(enqueue_ingest(payload))
+    assert job_id, "任务没有被 broker 接受"
+    assert queue_depth() is not None, "队列深度指标不可用（arq 键布局变了？）"
+    assert queue_depth() >= 1, f"入队后深度应 >= 1，实际 {queue_depth()}"
+
+    result = _run(worker_task({}, payload))
+    assert json.dumps(result)  # worker 返回可序列化，arq 才会接受
+
+    record = registry.get_document(kb_id, doc_id)
+    assert record["status"] == "indexed" and record["chunk_count"] >= 1
+    assert record["chunk_count"] == store.count(kb_id=kb_id), "状态里的数量与真实写入不一致"
+
+    # 工单 13 的落点：worker 写完必须留下跨进程失效信号
+    assert tracker.current(kb_id) == version_before + 1, (
+        "kb 版本号没有前进 —— 换成真 worker 进程后，API 侧的关键词索引不会重建，"
+        "表现为『文档传上去了但搜不到、重启又好了』"
+    )
+    hits = store.search("年假要几天", top_k=3, kb_id=kb_id)
+    assert hits, "摄取成功但检索不到内容"
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)

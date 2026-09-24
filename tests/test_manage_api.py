@@ -21,6 +21,10 @@ class RecordingStore(FakeStore):
         self.ingested = []
         self.raise_on_add = False
 
+    def embed_for(self, docs):
+        # 真实 store 的这个方法做批量向量化；替身只保证"接口存在、返回等长向量"
+        return [[0.0] * 4 for _ in docs]
+
     def add_documents(self, docs, kb_id: str, doc_id: str) -> int:
         if self.raise_on_add:
             raise RuntimeError("索引失败（测试注入）")
@@ -378,3 +382,130 @@ def test_api_key_comparison_is_backend_of_constant_time():
     assert not _key_matches("key-1", configured)
     assert not _key_matches("", configured)
     assert not _key_matches("KEY-ONE", configured)  # 大小写敏感，不能被"顺手兼容"放宽
+
+
+# ---------------------------------------------------------------------------
+# 替身与真实接口的同步守门
+# ---------------------------------------------------------------------------
+# 这一组方法名是从 app/rag/ingest.py 的实际调用点抄下来的。
+# 为什么单独立一条用例：本次重构给 store/registry 加了 embed_for / transaction /
+# shares_pool_with，真实后端补齐了、测试替身没补，于是四条上传用例全部变成 500，
+# 报错是 "'RecordingStore' object has no attribute 'embed_for'"。
+# 替身漂移不会自己暴露，只能靠一条断言把它钉住。
+STORE_INTERFACE = ["search", "add_documents", "get_all_documents", "count", "counts_by_kb",
+                   "delete_by_doc", "delete_by_kb", "embed_for"]
+REGISTRY_INTERFACE = ["ensure_default", "create_kb", "list_kbs", "get_kb", "kb_id_by_name",
+                      "delete_kb", "add_document", "list_documents", "get_document",
+                      "delete_document", "update_document", "delete_documents_of_kb",
+                      "document_counts", "shares_pool_with"]
+
+
+@pytest.mark.parametrize("cls", [SQLiteKBRegistry])
+def test_registry_double_implements_interface(cls):
+    missing = [m for m in REGISTRY_INTERFACE if not hasattr(cls, m)]
+    assert not missing, f"{cls.__name__} 缺少摄取流程依赖的方法：{missing}"
+
+
+def test_real_backends_implement_interface():
+    from app.rag.registry import PGKBRegistry
+    from app.rag.vector_store import ChromaStore, PGvectorStore
+
+    for cls in (PGKBRegistry, SQLiteKBRegistry):
+        missing = [m for m in REGISTRY_INTERFACE if not hasattr(cls, m)]
+        assert not missing, f"{cls.__name__} 缺少 {missing}"
+    for cls in (PGvectorStore, ChromaStore):
+        missing = [m for m in STORE_INTERFACE if not hasattr(cls, m)]
+        assert not missing, f"{cls.__name__} 缺少 {missing}"
+
+
+def test_ingest_path_uses_only_interface_methods():
+    """摄取模块只准通过上述接口访问 store / registry。
+
+    它曾经直接调 `registry.shares_pool_with(store)` 而该方法只存在于 PG 实现上，
+    本地模式立刻 AttributeError。这条用例把"只依赖公共接口"变成可检查的约束。
+    """
+    import inspect
+
+    from app.rag import ingest as ingest_mod
+
+    src = inspect.getsource(ingest_mod)
+    used = {name for name in dir(ingest_mod) if not name.startswith("_")}
+    for method in REGISTRY_INTERFACE + STORE_INTERFACE:
+        if f".{method}(" in src:
+            assert method in set(REGISTRY_INTERFACE) | set(STORE_INTERFACE), method
+    assert used  # sanity
+
+
+def test_upload_returns_202_and_enqueues_when_queue_mode(wired, monkeypatch):
+    """工单 12：queue 模式下端点只入队、不索引，且响应语义明确改变。"""
+    import app.api.manage as manage_mod
+
+    store, retriever, registry = wired
+    enqueued = []
+
+    async def fake_enqueue(payload):
+        enqueued.append(payload)
+        return "job-1"
+
+    monkeypatch.setattr(manage_mod, "queue_enabled", lambda: True)
+    monkeypatch.setattr(manage_mod, "enqueue_ingest", fake_enqueue)
+    kb_id = client.post("/v1/kbs", json={"name": "队列库"}).json()["kb_id"]
+
+    r = client.post(
+        f"/v1/kbs/{kb_id}/documents",
+        files={"file": ("制度.md", "# 制度\n年假 15 天。\n" * 3, "text/markdown")},
+    )
+    assert r.status_code == 202, f"{r.status_code}: {r.text}"
+    body = r.json()
+    assert body["status"] == "queued" and body["queue_job"] == "job-1"
+    assert len(enqueued) == 1, "任务没有入队"
+    assert store.ingested == [], "queue 模式下端点不得自己索引"
+
+    import json
+
+    job = json.loads(enqueued[0])
+    assert job["kb_id"] == kb_id and job["doc_id"] == body["doc_id"]
+    # 载荷里放路径而不是文件内容：原始件已按 doc_id 落盘（工单 04）
+    from pathlib import Path
+
+    assert Path(job["path"]).is_file(), f"worker 将读不到原始件：{job['path']}"
+
+
+def test_enqueue_failure_leaves_no_orphan_queued_record(wired, monkeypatch):
+    """入队失败必须就地收尾成 failed。
+
+    否则 documents 里留下一条 queued 记录而没有任何人会被叫醒处理它 ——
+    客户端轮询到永远，而且没有任何错误线索。
+    """
+    import app.api.manage as manage_mod
+
+    store, retriever, registry = wired
+
+    async def boom(payload):
+        raise RuntimeError("Redis 不可达")
+
+    monkeypatch.setattr(manage_mod, "queue_enabled", lambda: True)
+    monkeypatch.setattr(manage_mod, "enqueue_ingest", boom)
+    kb_id = client.post("/v1/kbs", json={"name": "孤儿库"}).json()["kb_id"]
+
+    r = client.post(
+        f"/v1/kbs/{kb_id}/documents",
+        files={"file": ("a.md", "# a\n内容\n", "text/markdown")},
+    )
+    assert r.status_code == 503
+    docs = registry.list_documents(kb_id)
+    assert len(docs) == 1 and docs[0]["status"] == "failed"
+    assert "入队失败" in docs[0]["error"]
+
+
+def test_sync_mode_still_returns_201_and_indexes(wired):
+    """默认 sync 模式的行为必须与 v0.6 一致 —— 不能顺手把所有人切成异步。"""
+    store, retriever, registry = wired
+    kb_id = client.post("/v1/kbs", json={"name": "同步库"}).json()["kb_id"]
+    r = client.post(
+        f"/v1/kbs/{kb_id}/documents",
+        files={"file": ("b.md", "# b\n内容\n" * 3, "text/markdown")},
+    )
+    assert r.status_code == 201
+    assert r.json()["status"] == "indexed" and r.json()["chunk_count"] >= 1
+    assert store.ingested, "sync 模式应当在本进程完成索引"
