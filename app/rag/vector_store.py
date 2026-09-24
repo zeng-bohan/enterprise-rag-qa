@@ -19,11 +19,13 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from pgvector.psycopg import register_vector
 from pgvector.vector import Vector
+from contextlib import contextmanager
+
 from psycopg.types.json import Jsonb
-from psycopg_pool import ConnectionPool
 
 from app.config import settings
 from app.core.embeddings import BGEEmbeddings
+from app.core.pg_pool import get_pool
 
 
 def content_hash(text: str) -> str:
@@ -67,38 +69,16 @@ class PGvectorStore:
 
     - 表结构：chunks(id, kb_id, doc_id, content, metadata jsonb, embedding vector(512))
     - 相似度：余弦距离（<=> 算子），score = 1 - distance，与 Chroma 后端口径一致
-    - 并发：psycopg_pool 连接池（FastAPI 线程池并发请求时连接不共享、线程安全）
+    - 并发：与注册中心共用一个进程级连接池（app/core/pg_pool.py，工单 10）——
+      既为连接数，也为 chunks 与 documents 能落进同一个事务（工单 18）
     """
 
     def __init__(self) -> None:
         self._embeddings = BGEEmbeddings()
-        self._pool = ConnectionPool(
-            settings.postgres_dsn,
-            min_size=1,
-            max_size=8,
-            kwargs={"autocommit": True},
-            open=True,
-        )
+        # 共享池：见 app/core/pg_pool.py（工单 10）
+        self._dsn = settings.postgres_dsn
+        self._pool = get_pool(self._dsn, max_size=8, application_name="rag-app")
         self._init_schema()
-
-    def __init__(self) -> None:
-        self._embeddings = BGEEmbeddings()
-        self._pool = ConnectionPool(
-            settings.postgres_dsn,
-            min_size=1,
-            max_size=8,
-            kwargs={"autocommit": True},
-            # 每条新连接带上查询期的 HNSW 候选队列长度。放在 configure 而不是每条
-            # query 前 SET 一次：省一次往返，且 autocommit 下 SET LOCAL 根本不生效。
-            configure=self._configure_conn,
-            open=True,
-        )
-        self._init_schema()
-
-    @staticmethod
-    def _configure_conn(conn) -> None:
-        if settings.ann_index == "hnsw":
-            conn.execute(f"SET hnsw.ef_search = {int(settings.hnsw_ef_search)}")
 
     def _init_schema(self) -> None:
         with self._pool.connection() as conn:
@@ -151,6 +131,59 @@ class PGvectorStore:
             " USING hnsw (embedding vector_cosine_ops)"
             f" WITH (m = {settings.hnsw_m}, ef_construction = {settings.hnsw_ef_construction})"
         )
+
+    def embed_for(self, docs: List[Document]) -> List[List[float]]:
+        """预先算好整批向量。
+
+        存在的理由（工单 18）：事务写入必须**在拿到连接之前**完成推理。
+        否则一条 PG 连接会被批量 ONNX 计算按几十秒，池子里 8 条连接能同时被
+        几个上传占光，在线检索直接饿死。
+        """
+        return self._embeddings.embed_documents([d.page_content for d in docs])
+
+    def add_documents_on(self, conn, docs: List[Document], kb_id: str, doc_id: str,
+                         vectors: List[List[float]]) -> int:
+        """在**给定连接**上写入 chunk（不自己取连接），供外层事务包裹。"""
+        register_vector(conn)
+        with conn.cursor() as cur:
+            for doc, vec in zip(docs, vectors):
+                cur.execute(
+                    "INSERT INTO chunks (id, kb_id, doc_id, content_hash, content, metadata, embedding)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content,"
+                    " kb_id = EXCLUDED.kb_id, doc_id = EXCLUDED.doc_id,"
+                    " content_hash = EXCLUDED.content_hash,"
+                    " metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding",
+                    (
+                        chunk_uid(doc_id, doc.page_content),
+                        kb_id,
+                        doc_id,
+                        content_hash(doc.page_content),
+                        doc.page_content,
+                        Jsonb(doc.metadata),
+                        Vector(vec),
+                    ),
+                )
+        return len(docs)
+
+    @contextmanager
+    def transaction(self):
+        """借一条连接开一个真事务，退出时**必定归还**给池。
+
+        三个易错点都在这里处理掉：
+        - getconn 之后必须 putconn，否则几个上传就能把 8 条连接永久借光；
+        - 池里的连接是 autocommit 的，事务期间要关掉、归还前必须恢复，
+          否则下一个借到这条连接的人会莫名其妙跑在一个未提交的事务里；
+        - `with conn:` 只负责 commit/rollback，不负责还连接。
+        """
+        conn = self._pool.getconn()
+        try:
+            conn.autocommit = False
+            with conn:  # 正常结束提交，异常回滚
+                yield conn
+        finally:
+            conn.autocommit = True
+            self._pool.putconn(conn)
 
     def add_documents(self, docs: List[Document], kb_id: str, doc_id: str) -> int:
         """写入一批 chunk，血缘（kb_id/doc_id）同时进列与 metadata。
@@ -274,6 +307,18 @@ class ChromaStore:
             persist_directory=settings.chroma_dir,
             collection_metadata={"hnsw:space": "cosine"},
         )
+
+    def embed_for(self, docs: List[Document]) -> List[List[float]]:
+        return self._embeddings.embed_documents([d.page_content for d in docs])
+
+    def transaction(self):
+        """本地模式没有跨引擎事务，只有双 PG 后端有（见 PGvectorStore.transaction）。
+
+        刻意抛错而不是"静默给一个假事务"：Chroma 是独立引擎，把它的写入包进
+        PostgreSQL 的事务里只会让人以为得到了原子性。调用方用
+        registry.shares_pool_with(store) 判断后根本不会走到这里。
+        """
+        raise NotImplementedError("ChromaStore 不支持跨表事务，请使用双 PG 后端")
 
     def add_documents(self, docs: List[Document], kb_id: str, doc_id: str) -> int:
         for d in docs:

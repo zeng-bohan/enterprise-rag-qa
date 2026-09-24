@@ -21,6 +21,7 @@ from langchain_core.documents import Document
 
 from app.config import settings
 from app.core.executor import run_cpu
+from app.core.kb_version import KBVersionTracker
 from app.rag.bm25_index import BM25Index
 from app.rag.query_rewriter import QueryRewriter
 from app.rag.reranker import CrossEncoderReranker
@@ -66,21 +67,32 @@ class HybridRetriever:
         self._store = store
         self._rewriter = rewriter if rewriter is not None else QueryRewriter()
         self._reranker = reranker if reranker is not None else CrossEncoderReranker()
-        # 每知识库一个 BM25 索引，惰性构建；文档增删后 invalidate(kb_id)
-        self._bm25_cache: Dict[str, BM25Index] = {}
+        # 每知识库一个 BM25 索引，惰性构建，并记录构建时的 kb 版本。
+        # 带版本而不是只靠 invalidate()（工单 13）：摄取移进 worker 进程后，
+        # 写入方再也调用不到本进程的 invalidate()，只靠进程内信号就会永久失效。
+        self._bm25_cache: Dict[str, Tuple[BM25Index, int]] = {}
+        self._versions = KBVersionTracker()
 
     def invalidate(self, kb_id: Optional[str] = None) -> None:
-        """文档 / 知识库变更后使 BM25 索引失效（None = 全部失效）。"""
+        """文档 / 知识库变更后使 BM25 索引失效（None = 全部失效）。
+
+        同时丢掉版本轮询缓存，让下一次检查真的去共享存储读一次 —— 否则同进程
+        写入会被本地 TTL 挡住，白等一个轮询窗口。
+        """
         if kb_id is None:
             self._bm25_cache.clear()
+            self._versions.forget()
         else:
             self._bm25_cache.pop(kb_id, None)
+            self._versions.forget(kb_id)
 
     def _bm25_for(self, kb_id: str) -> BM25Index:
-        index = self._bm25_cache.get(kb_id)
-        if index is None:
-            index = BM25Index(self._store.get_all_documents(kb_id))
-            self._bm25_cache[kb_id] = index
+        entry = self._bm25_cache.get(kb_id)
+        version = self._versions.current(kb_id)
+        if entry is not None and entry[1] == version:
+            return entry[0]
+        index = BM25Index(self._store.get_all_documents(kb_id))
+        self._bm25_cache[kb_id] = (index, self._versions.current(kb_id))
         return index
 
     def _finalize(

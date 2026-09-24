@@ -63,6 +63,36 @@ def _require_pg_or_skip() -> None:
     pytest.skip(detail)
 
 
+def _probe_redis() -> dict:
+    try:
+        import redis as redis_lib
+
+        client = redis_lib.Redis.from_url(settings.redis_url, socket_connect_timeout=3)
+        client.ping()
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _require_redis_or_skip() -> None:
+    """与 _require_pg_or_skip 同一条策略：CI 里缺中间件是失败，不是跳过。
+
+    否则"契约测试全绿"可以靠跳过异步用例得到 —— 这正是工单 05 要消灭的情形。
+    """
+    state = _probe_redis()
+    if state["ok"]:
+        return
+    import os
+
+    detail = (
+        f"Redis 不可用（{state['error']}）。本地请先 docker compose up -d；"
+        "异步摄取用例需要真实 broker。"
+    )
+    if os.environ.get("CI") or os.environ.get("RAG_CONTRACT_STRICT"):
+        pytest.fail(detail, pytrace=False)
+    pytest.skip(detail)
+
+
 # ---------------------------------------------------------------------------
 # 确定性伪向量
 # ---------------------------------------------------------------------------

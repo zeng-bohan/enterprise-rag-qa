@@ -28,7 +28,7 @@ import re
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile
 
 from app.config import settings
 from app.core.auth import require_api_key, require_rate_limit
@@ -36,8 +36,9 @@ from app.core.executor import run_cpu, run_ingest, run_meta
 from app.core.metrics import counted
 from app.api.deps import pipeline as qa_pipeline
 from app.api.errors import backend_errors
-from app.rag.chunker import split_documents
-from app.rag.document_loader import SUPPORTED_SUFFIXES, load_document
+from app.core.queue import enqueue_ingest, ingest_job_payload, queue_enabled
+from app.rag.document_loader import SUPPORTED_SUFFIXES
+from app.rag.ingest import ingest_document
 from app.rag.generator import build_context
 from app.rag.registry import KBError
 from app.schemas import CreateKBRequest, RetrievalTestRequest
@@ -144,60 +145,83 @@ async def _read_capped(file: UploadFile) -> bytes:
 
 
 @router.post("/kbs/{kb_id}/documents", status_code=201)
-async def upload_document(kb_id: str, file: UploadFile) -> dict:
-    """上传并同步索引一个文档（multipart/form-data，字段名 file）。"""
+async def upload_document(kb_id: str, file: UploadFile, response: Response) -> dict:
+    """上传文档。
+
+    两种模式（`INGEST_MODE`，工单 12）：
+
+    - `sync`（默认）：请求内完成解析→切片→向量化→写入，返回 **201**，
+      响应里 `status=indexed`、`chunk_count` 立即可得。行为与 v0.6 一致。
+    - `queue`：原始件落盘 + 登记 `queued` 记录 + 入队，返回 **202**，
+      索引由独立 worker 进程完成，客户端轮询文档详情。
+
+    为什么默认还是 sync：202 是破坏性变更（chunk_count 不再立即可得），
+    不该由一次"性能优化"顺手改变所有调用方的行为。生产 compose 里显式开 queue。
+
+    状态机：queued → indexing → indexed | failed。记录只创建一次，
+    后续都是 update_document —— 修复前失败路径会再 add_document 一次，
+    于是同一次失败上传留下两条记录，第一条还声称有 N 个 chunk。
+    """
     with backend_errors():
         try:
             await run_meta(qa_pipeline.registry.get_kb, kb_id)
         except KBError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
-        suffix = Path(file.filename or "").suffix.lower()
+        filename = file.filename or "document"
+        suffix = Path(filename).suffix.lower()
         if suffix not in SUPPORTED_SUFFIXES:
             raise HTTPException(status_code=415, detail=f"不支持的文件类型: {suffix or '(无后缀)'}")
 
         content = await _read_capped(file)
 
-        def _store_original(doc_id: str) -> Path:
-            d = UPLOADS_DIR / doc_id
-            d.mkdir(parents=True, exist_ok=True)
-            path = d / safe_name(file.filename or "")
-            path.write_bytes(content)
-            return path
-
-        def _ingest() -> dict:
-            """先登记 indexing 记录，再索引，最后改写状态。
-
-            旧写法是「add_document(indexed) → store.add_documents，失败再
-            add_document(failed)」，于是同一次失败上传留下两条 documents 记录，
-            且第一条声称有 N 个 chunk 而实际一个都没写进去（幽灵文档）。
-            现在记录只创建一次，状态由 update_document 推进。
-            """
+        def _register() -> tuple[dict, Path]:
+            """登记文档并把原始件按 doc_id 落盘（工单 04）。"""
             record = qa_pipeline.registry.add_document(
-                kb_id, file.filename or "document", chunk_count=0, status="indexing"
+                kb_id, filename, chunk_count=0, status="queued"
             )
-            doc_id = record["doc_id"]
+            target = UPLOADS_DIR / record["doc_id"]
+            target.mkdir(parents=True, exist_ok=True)
+            path = target / safe_name(filename)
+            path.write_bytes(content)
+            return record, path
+
+        record, stored_path = await run_meta(_register)
+        doc_id = record["doc_id"]
+
+        if queue_enabled():
+            payload = ingest_job_payload(kb_id, doc_id, str(stored_path), filename)
             try:
-                path = _store_original(doc_id)
-                docs = load_document(path)
-                chunks = split_documents(docs)
-                qa_pipeline.store.add_documents(chunks, kb_id=kb_id, doc_id=doc_id)
+                job_id = await enqueue_ingest(payload)
             except Exception as exc:
-                # 解析 / 索引失败：状态落 failed（可追溯），对外 500
-                qa_pipeline.registry.update_document(
-                    kb_id, doc_id, status="failed", chunk_count=0, error=str(exc)[:500]
+                # 入队失败必须就地收尾：留下一条 queued 记录等于造一个孤儿
+                # —— 没有任何人会被叫醒处理它，客户端会轮询到永远。
+                await run_meta(
+                    qa_pipeline.registry.update_document, kb_id, doc_id,
+                    status="failed", chunk_count=0, error=f"入队失败: {exc}"[:500],
                 )
+                raise HTTPException(status_code=503, detail=f"摄取队列不可用: {exc}")
+            response.status_code = 202
+            return {**record, "status": "queued", "queue_job": job_id}
+
+        def _sync_ingest() -> dict:
+            try:
+                return ingest_document(
+                    qa_pipeline.store, qa_pipeline.registry, kb_id, doc_id, stored_path
+                )
+            except Exception as exc:
+                if qa_pipeline.registry.get_document(kb_id, doc_id)["status"] != "failed":
+                    qa_pipeline.registry.update_document(
+                        kb_id, doc_id, status="failed", chunk_count=0, error=str(exc)[:500]
+                    )
                 raise HTTPException(status_code=500, detail=f"文档索引失败: {exc}")
-            record = qa_pipeline.registry.update_document(
-                kb_id, doc_id, status="indexed", chunk_count=len(chunks)
-            )
-            qa_pipeline.retriever.invalidate(kb_id)
-            return record
 
         try:
-            return await run_ingest(_ingest)
+            result = await run_ingest(_sync_ingest)
         except HTTPException:
             raise
+        qa_pipeline.retriever.invalidate(kb_id)  # 同进程快速通道，不等轮询窗口
+        return result
 
 
 @router.get("/kbs/{kb_id}/documents")

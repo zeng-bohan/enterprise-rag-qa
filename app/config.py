@@ -89,6 +89,11 @@ class Settings(BaseSettings):
     # 而 LLM 首 token 就可能等到十几秒 —— 不发心跳，长答案会在代理处被掐断。
     sse_heartbeat_seconds: float = 15.0
 
+    # ---- 摄取模式（工单 12）----
+    # sync：上传请求内同步索引（默认，保持既有部署与离线测试行为不变）
+    # queue：入队交给 arq worker，响应变 202、chunk_count 稍后可见（破坏性，故不默认）
+    ingest_mode: str = "sync"
+
     # ---- 服务 ----
     host: str = "127.0.0.1"
     port: int = 8000
