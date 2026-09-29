@@ -232,6 +232,14 @@ pytest tests -m contract -q        # 需要先 docker compose up -d
 
 v0.6 有意不做、按优先级排列的主流知识库能力：大文件异步导入、父子（小块 retrieval/大块 generation）切片、Office 格式解析（docx/xlsx/pptx）、按库访问控制、连接器同步（网页/Confluence/飞书）、回答反馈闭环。
 
+## 支持
+
+缺陷、问题与功能想法：[提一个 issue](https://github.com/zeng-bohan/enterprise-rag-qa/issues)。缺陷报告请附复现步骤与相关日志或响应体。
+
+## 参与
+
+个人维护项目。欢迎通过 issue 反馈缺陷与想法；代码改动请先开 issue 讨论方案再动手。
+
 ## 许可证
 
 [MIT](LICENSE)

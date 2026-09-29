@@ -238,6 +238,14 @@ The rationale behind every major choice is written up in [docs/DESIGN.md](docs/D
 
 Mainstream-KB capabilities deliberately left out of v0.6, in priority order: async ingestion for large files, parent-child (small-to-big) chunking, Office-format parsing (docx/xlsx/pptx), per-KB access control, connector sync (web/Confluence/Feishu), and answer feedback loops.
 
+## Support
+
+Bugs, questions, and feature ideas: [open an issue](https://github.com/zeng-bohan/enterprise-rag-qa/issues). Bug reports should include reproduction steps and the relevant logs or response bodies.
+
+## Contributing
+
+This is a solo-maintained project. Issues for bugs and ideas are very welcome; for code changes, please open an issue first so the approach can be discussed before you invest time.
+
 ## License
 
 [MIT](LICENSE)
