@@ -2,18 +2,21 @@
   <img src="docs/banner.svg" width="800" alt="Enterprise Knowledge-base RAG Q&A" />
 </p>
 
-# Enterprise Knowledge-base RAG Q&A
+<h1 align="center">Enterprise Knowledge-base RAG Q&A</h1>
 
-> English | [简体中文](README.zh-CN.md)
+<p align="center">
+  An enterprise RAG service for document-grounded question answering — multi-knowledge-base management, hybrid retrieval, streaming answers, and multi-turn chat, with an evaluation suite instead of marketing numbers.
+</p>
 
-An enterprise RAG service for document-grounded question answering — multi-knowledge-base management, document lifecycle, hybrid retrieval, streaming answers, and multi-turn chat. Built to the feature bar of mainstream KB products (Dify / FastGPT / RAGFlow), with an evaluation suite instead of marketing numbers.
-
-The service is **API-first by design**: every capability ships as a REST endpoint (interactive Swagger at `/docs`, curl recipes below) — there is no web console in v0.6.
+<p align="center">
+  English | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-93%20offline%20%2B%2034%20backend%20contract-2EA043?style=flat-square)
+![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
+
+The service is **API-first by design**: every capability ships as a REST endpoint (interactive Swagger at `/docs`, curl recipes below) — there is no web console in v0.6.
 
 ## Results at a glance
 
@@ -60,7 +63,19 @@ Measured with the bundled evaluation suite — methodology and full reports in [
 - Prometheus metrics (`/metrics`), per-stage latency histograms, cache/LLM counters.
 - Redis caches degrade gracefully when unavailable; local mode needs no Redis at all.
 - Optional API-key auth (`X-API-Key`) on all `/v1` routes; health and metrics stay open.
-- Measured on the project evaluation set: Recall@1 **87.4%**, Faithfulness **94.1%**, and P95 latency improved from **32s** to **10s** after the asynchronous pipeline work. These predate the evaluation-methodology revision described in [Tests & evaluation](#tests--evaluation).
+
+## Tech stack
+
+| Layer | Technologies |
+| --- | --- |
+| API | FastAPI, pydantic-settings, SSE streaming |
+| Retrieval | BM25 (jieba) + vector recall, reciprocal rank fusion, Cross-Encoder rerank (fastembed) |
+| Embeddings | BGE, local via fastembed/ONNX with caching |
+| Generation | DeepSeek (OpenAI-compatible API) |
+| Storage | PostgreSQL + pgvector **or** Chroma + SQLite registry; Redis cache (graceful degradation) |
+| Observability | Prometheus `/metrics`, per-stage latency histograms |
+| Evaluation | RAGAS faithfulness/relevancy, Recall@k harness, pytest (offline + contract) |
+| Ops | Docker Compose, GitHub Actions CI |
 
 ## Architecture
 
@@ -233,6 +248,15 @@ Both suites above are being reworked (stratified sampling, chunk-level de-duplic
 ## Design decisions
 
 The rationale behind every major choice is written up in [docs/DESIGN.md](docs/DESIGN.md) (16 sections, 中文): LLM / embedding / vector-store selection, Chinese-aware chunking, why hybrid retrieval + RRF + rerank, the two-path refusal design, cache key design, the streaming event protocol, and the async concurrency latency write-up.
+
+## Notes and gotchas
+
+- **No web console in v0.6.** The service is API-first — the interactive Swagger UI at `/docs` is the interface; the curl recipes above cover the common flows.
+- **Zero-dependency local run.** `VECTOR_BACKEND=chroma` swaps PostgreSQL + Redis for a local SQLite registry and Chroma — no Docker required to try the pipeline.
+- **Contract tests are not skippable.** `pytest -m contract` needs `docker compose up -d`; in CI a missing PostgreSQL is a failure, not a skip — that gap is exactly what the contract half exists to close.
+- **Evaluation numbers are honest but not final.** Real measurements of the shipped pipeline, pending the methodology revision (tickets 21–28) — see the caveat at the top.
+- **Auth is opt-in.** With no `API_KEY` set, all `/v1` routes are open; health and metrics always stay open. Semantic cache is bypassed for multi-turn requests by design — follow-up answers are never served from cache.
+- **Windows paths.** The venv interpreter lives at `.venv\Scripts\python` on Windows versus `.venv/bin/python` elsewhere — the snippets above cover both.
 
 ## Roadmap
 
