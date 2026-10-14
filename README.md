@@ -1,275 +1,148 @@
-<p align="center">
-  <img src="docs/banner.svg" width="800" alt="Enterprise Knowledge-base RAG Q&A" />
-</p>
+# 企业知识库 RAG 问答
 
-<h1 align="center">Enterprise Knowledge-base RAG Q&A</h1>
+基于 FastAPI 的文档问答服务，支持多知识库管理、文档索引、混合检索、引用回答和流式对话。项目提供 Chroma 本地模式与 PostgreSQL/pgvector 部署配置。
 
-<p align="center">
-  An enterprise RAG service for document-grounded question answering — multi-knowledge-base management, hybrid retrieval, streaming answers, and multi-turn chat, with an evaluation suite instead of marketing numbers.
-</p>
+## 功能
 
-<p align="center">
-  English | <a href="README.zh-CN.md">简体中文</a>
-</p>
+- 管理多个知识库和文档；支持 PDF、Markdown、TXT 上传、删除和文档到切片的来源追踪。
+- 使用 BM25 与向量检索召回，经过 RRF 融合和 Cross-Encoder 重排后生成回答。
+- 支持多轮对话、引用、低相关度拒答、语义缓存和 SSE 流式输出。
+- 支持 Chroma 与 pgvector 向量后端；元数据可使用 SQLite 或 PostgreSQL，Redis 用于缓存与可选的异步摄取。
+- 可选 API Key 鉴权、请求限流和 Prometheus 指标。
 
-![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-[![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
-![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
+## 技术栈
 
-The service is **API-first by design**: every capability ships as a REST endpoint (interactive Swagger at `/docs`, curl recipes below) — there is no web console in v0.6.
-
-## Results at a glance
-
-Measured with the bundled evaluation suite — methodology and full reports in [Tests & evaluation](#tests--evaluation).
-
-> **Evaluation methodology is under revision.** The numbers below are real measurements
-> of the shipped pipeline, but an audit of how the evaluation set is constructed surfaced
-> three limitations that will change how they are reported (confidence intervals, stratified
-> sampling, a non-DeepSeek judge model, and a refusal-rate baseline). Tracking: tickets 21–28
-> in the remediation plan. Two facts worth stating up front, both recomputed from the files
-> in `data/qa_set/`: the 334 questions cover **80 distinct gold chunks** (≈4.2 questions per
-> chunk, so the effective sample is ~80 correlated trials rather than 334 independent ones),
-> and the n=100 RAGAS subset is `qa_set[:100]` — a head slice, which happens to come from a
-> **single source document**.
-
-| Metric | Result |
+| 范围 | 技术 |
 | --- | --- |
-| Recall@1 / Recall@3 / Recall@5 (n=334 rows / 80 unique gold chunks, hybrid) | **87.4%** / **97.9%** / **98.2%** |
-| Faithfulness (RAGAS, n=100 head slice, self-judged) | **94.1%** |
-| Answer relevancy (RAGAS) | **88.7%** |
-| Hallucination rate (RAGAS) | **5.9%** |
-| P95 latency (after the async pipeline work) | 32s → **10s** — tail latency only; throughput was ~0.9 QPS in both runs, and the "after" figure is measured post-warmup. Not yet published as a committed report (ticket 26). |
+| 服务与 API | Python、FastAPI、Uvicorn、Pydantic Settings |
+| RAG 与模型 | LangChain、DeepSeek 兼容 API、FastEmbed/ONNX、BM25、Cross-Encoder |
+| 存储 | Chroma 或 PostgreSQL/pgvector；SQLite 元数据；可选 Redis |
+| 运行与验证 | Docker Compose、pytest、GitHub Actions |
 
-## Features
+CI 使用 Python 3.12。向量化与重排模型在本机运行；首次使用时可能需要下载模型文件。
 
-**Knowledge base management**
-- Multiple knowledge bases; documents are uploaded per KB and indexed synchronously (parse → chunk → embed → link).
-- Document lifecycle with full chunk lineage (`kb_id` / `doc_id` on every chunk): list, delete a document (its chunks go with it), delete a KB (everything goes with it).
-- Two storage profiles behind one interface: **PostgreSQL + pgvector** (production, docker compose) or **Chroma + SQLite registry** (zero-dependency local). Switch with `VECTOR_BACKEND`.
+## 处理流程
 
-**Retrieval**
-- Hybrid recall: BM25 (jieba) + vector search, fused by reciprocal rank fusion, then Cross-Encoder reranking.
-- Per-KB BM25 index, lazily built and invalidated on document changes.
-- Answer refusal on two paths (pre-retrieval score floor + rerank floor) — no LLM tokens are burned on out-of-KB questions.
-- `POST /v1/retrieval-test` — hit testing without generation (the "retrieval testing" page of Dify / FastGPT).
-
-**Generation**
-- Numbered citations, grounded prompts, and refusal fallback.
-- Streaming answers over SSE: `citations → token* → done` event protocol.
-- Multi-turn chat: follow-up questions are condensed into standalone queries before retrieval; conversation history is injected into generation.
-- Semantic cache keyed by question + hit-document set (auto-invalidated when the KB changes); multi-turn requests bypass the cache by design.
-
-**Operations**
-- Prometheus metrics (`/metrics`), per-stage latency histograms, cache/LLM counters.
-- Redis caches degrade gracefully when unavailable; local mode needs no Redis at all.
-- Optional API-key auth (`X-API-Key`) on all `/v1` routes; health and metrics stay open.
-
-## Tech stack
-
-| Layer | Technologies |
-| --- | --- |
-| API | FastAPI, pydantic-settings, SSE streaming |
-| Retrieval | BM25 (jieba) + vector recall, reciprocal rank fusion, Cross-Encoder rerank (fastembed) |
-| Embeddings | BGE, local via fastembed/ONNX with caching |
-| Generation | DeepSeek (OpenAI-compatible API) |
-| Storage | PostgreSQL + pgvector **or** Chroma + SQLite registry; Redis cache (graceful degradation) |
-| Observability | Prometheus `/metrics`, per-stage latency histograms |
-| Evaluation | RAGAS faithfulness/relevancy, Recall@k harness, pytest (offline + contract) |
-| Ops | Docker Compose, GitHub Actions CI |
-
-## Architecture
-
-```mermaid
+~~~mermaid
 flowchart LR
-    subgraph MGMT[Management]
-        U["upload (multipart)"] --> API["Management API<br/>/v1/kbs · /v1/kbs/{id}/docs"]
-        API --> REG["KBRegistry<br/>PG tables / SQLite<br/>metadata: KB, document, status"]
-        API --> VS["Vector store<br/>PGvector / Chroma<br/>chunks (kb_id, doc_id lineage)"]
-    end
+    D[PDF / Markdown / TXT] --> P[解析与切片]
+    P --> V[向量索引与文档元数据]
+    Q[问题] --> R[BM25 + 向量召回]
+    V --> R
+    R --> F[RRF 融合与重排]
+    F --> L[LLM 生成]
+    L --> A[回答与引用 / SSE]
+~~~
 
-    subgraph PIPE[RAGPipeline]
-        Q["question<br/>/v1/chat · /v1/chat/stream"] --> C["1. condense (multi-turn)<br/>query rewrite (LLM)"]
-        C --> R["2. BM25 (per-KB) + vector recall<br/>filtered by kb_id"]
-        R --> F["3. reciprocal rank fusion<br/>→ Cross-Encoder rerank"]
-        F --> RF["4. refusal floor /<br/>evidence threshold"]
-        RF --> G["5. DeepSeek generation<br/>with citations"]
-    end
+## 项目结构
 
-    G --> J["JSON: answer + citations + timings"]
-    G --> S["SSE: citations → token* → done"]
-```
+~~~text
+app/
+├── api/       # 对话、知识库与文档 API
+├── core/      # 配置、LLM、缓存、鉴权、指标与执行器
+└── rag/       # 文档解析、切片、索引、检索与生成
+data/
+├── docs/      # 随仓库提供的示例文档
+└── qa_set/    # 评测数据与报告
+scripts/       # 导入、提问与评测工具
+tests/         # 离线测试与存储后端契约测试
+docs/DESIGN.md # 主要设计决策
+docker-compose.yml
+.env.example
+~~~
 
-## Quick start
+## 快速开始
 
-### 1. Create the environment
+### 本地模式
 
-```bash
-# Windows
+本地模式使用 Chroma 和 SQLite，不需要启动 PostgreSQL 或 Redis。
+
+~~~bash
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-copy .env.example .env
-
-# macOS / Linux
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 cp .env.example .env
-```
+~~~
 
-Set your `DEEPSEEK_API_KEY` in `.env`.
+在 `.env` 中设置：
 
-### 2. Start PostgreSQL and Redis (production profile)
+~~~dotenv
+VECTOR_BACKEND=chroma
+DEEPSEEK_API_KEY=<你的模型 API Key>
+~~~
 
-```bash
-docker compose up -d
-```
+模型 API Key 用于生成回答；没有可用 Key 时服务仍可启动，但无法完成真实 LLM 回答。随后导入仓库中的示例文档并启动 API：
 
-For local runs without Docker, set `VECTOR_BACKEND=chroma` in `.env` — the KB registry falls back to a local SQLite file and no Redis is required.
+~~~bash
+python scripts/ingest_docs.py
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+~~~
 
-### 3. Ingest and run
+打开 [API 文档](http://127.0.0.1:8000/docs)。Windows PowerShell 可将激活命令替换为 `.venv\Scripts\Activate.ps1`，并用 `Copy-Item .env.example .env` 复制配置文件。
 
-```bash
-# Windows
-.venv\Scripts\python scripts/ingest_docs.py        # into the default KB; --kb name / --rebuild supported
-.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+### PostgreSQL 与 Redis
 
-# macOS / Linux
-.venv/bin/python scripts/ingest_docs.py
-.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+`docker compose up -d` 会启动 PostgreSQL、Redis 和摄取 worker；Compose 不包含 FastAPI 服务本身。使用 pgvector 时，在 `.env` 中设置 `VECTOR_BACKEND=pgvector`，并确认 `POSTGRES_DSN` 与 `REDIS_URL` 指向本机映射端口，然后在宿主机运行上面的 Uvicorn 命令。
 
-Open `http://127.0.0.1:8000/docs` for the interactive API documentation.
-
-### 4. Try it
-
-```bash
-# Ask (non-streaming)
-curl -X POST http://127.0.0.1:8000/v1/chat -H "Content-Type: application/json" \
-  -d '{"question": "员工请年假需要提前几天申请？"}'
-
-# Ask (SSE streaming: citations → token* → done)
-curl -N -X POST http://127.0.0.1:8000/v1/chat/stream -H "Content-Type: application/json" \
-  -d '{"question": "年假有多少天？"}'
-
-# Create a KB, upload a document, hit-test retrieval
-curl -X POST http://127.0.0.1:8000/v1/kbs -H "Content-Type: application/json" -d '{"name": "帮助中心"}'
-curl -X POST http://127.0.0.1:8000/v1/kbs/<kb_id>/documents -F "file=@手册.pdf"
-curl -X POST http://127.0.0.1:8000/v1/retrieval-test -H "Content-Type: application/json" \
-  -d '{"query": "年假政策", "kb_id": "<kb_id>"}'
-```
+同步摄取是默认模式。使用队列时，API 与 worker 两侧都要设置 `INGEST_MODE=queue`。
 
 ## API
 
-| Method | Path | Description |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| POST | `/v1/chat` | Ask a question; supports `kb_id` and `history` (multi-turn). Returns answer, citations, timings. |
-| POST | `/v1/chat/stream` | Same, as SSE: `citations → token* → done`. |
-| POST | `/v1/kbs` | Create a knowledge base. |
-| GET | `/v1/kbs` | List KBs with document / chunk counts. |
-| DELETE | `/v1/kbs/{kb_id}` | Delete a KB and all of its chunks. |
-| POST | `/v1/kbs/{kb_id}/documents` | Upload a file (multipart `file`, pdf/md/txt); parses, chunks, indexes. |
-| GET | `/v1/kbs/{kb_id}/documents` | List documents with status and chunk counts. |
-| DELETE | `/v1/kbs/{kb_id}/documents/{doc_id}` | Delete a document and its chunks. |
-| POST | `/v1/retrieval-test` | Retrieval hit-testing without generation. |
-| GET | `/health` | Health check. |
-| GET | `/metrics` | Prometheus request, latency, cache, and LLM metrics. |
+| POST | `/v1/chat` | 普通问答，支持知识库和对话历史 |
+| POST | `/v1/chat/stream` | SSE 流式问答 |
+| POST | `/v1/kbs` | 创建知识库 |
+| GET | `/v1/kbs` | 列出知识库 |
+| DELETE | `/v1/kbs/{kb_id}` | 删除知识库及其内容 |
+| POST | `/v1/kbs/{kb_id}/documents` | 上传文档 |
+| GET | `/v1/kbs/{kb_id}/documents` | 列出知识库文档 |
+| DELETE | `/v1/kbs/{kb_id}/documents/{doc_id}` | 删除文档及其切片 |
+| POST | `/v1/retrieval-test` | 只检索、不生成，用于检查召回结果 |
+| GET | `/health`、`/metrics` | 健康检查和 Prometheus 指标 |
 
-## Project structure
+启用 `API_KEYS` 后，`/v1` 业务接口需通过 `X-API-Key` 请求头鉴权；未配置时不启用鉴权。`/health` 与 `/metrics` 始终开放。完整交互文档可在服务启动后通过 `/docs` 查看。
 
-```text
-app/
-├── main.py            # FastAPI application (lifespan: ensure default KB)
-├── config.py          # environment configuration (.env, pydantic-settings)
-├── schemas.py         # request/response models
-├── api/
-│   ├── deps.py        # shared pipeline singleton
-│   ├── chat.py        # /v1/chat (JSON + SSE streaming)
-│   └── manage.py      # KB / document lifecycle, retrieval hit-testing
-├── core/
-│   ├── auth.py        # X-API-Key dependency (open when unset)
-│   ├── llm.py         # DeepSeek client (OpenAI-compatible)
-│   ├── embeddings.py  # local BGE embeddings (fastembed/ONNX) with caching
-│   ├── cache.py       # Redis cache with graceful degradation
-│   ├── executor.py    # bounded thread pool for CPU-bound work
-│   └── metrics.py     # Prometheus metrics
-└── rag/
-    ├── registry.py         # KB / document registry (PG tables / SQLite)
-    ├── document_loader.py  # PDF / Markdown / TXT parsing
-    ├── chunker.py          # Chinese-aware semantic chunking
-    ├── query_rewriter.py   # LLM query rewrite for BM25 recall
-    ├── bm25_index.py       # jieba + BM25Okapi keyword index
-    ├── vector_store.py     # PGvector / Chroma backends behind one interface
-    ├── retriever.py        # per-KB hybrid recall + RRF fusion + rerank + refusal
-    ├── reranker.py         # Cross-Encoder reranking (fastembed)
-    ├── generator.py        # citations, refusal, semantic cache, multi-turn, streaming
-    └── pipeline.py         # orchestration + per-stage timings
-scripts/
-├── ingest_docs.py      # ingest data/docs into a KB (per-document lineage)
-├── ask.py              # CLI question
-├── fetch_corpus.py     # fetch source documents
-├── gen_qa_set.py       # generate the chunk-grounded QA eval set
-├── eval_recall.py      # Recall@1/3/5 (hybrid vs vector-only baseline)
-├── eval_ragas.py       # RAGAS faithfulness / relevancy
-└── bench.py            # latency benchmark
-tests/                  # 89 offline tests (no PG / Redis / model downloads)
-data/qa_set/            # QA eval set and metric reports
-docker-compose.yml
-```
+示例问答：
 
-## Tests & evaluation
+~~~bash
+curl -X POST http://127.0.0.1:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"员工请年假需要提前几天申请？"}'
+~~~
 
-**Unit / integration tests — fully offline.** The suite stubs the LLM, Cross-Encoder, vector store, registry, and Redis, so it runs without PostgreSQL, Redis, model downloads, or network access:
+## 配置
 
-```bash
-pip install -r requirements-dev.txt
-pytest tests -q                          # everything (93 offline + 34 backend contract)
-pytest tests -m "not contract" -q        # offline only: no PostgreSQL, no Redis, no models
-pytest tests -m contract -q              # needs `docker compose up -d`
-```
+配置从仓库根目录的 `.env` 读取；完整字段和默认值见 [.env.example](.env.example)。
 
-The suite is split in two on purpose. The offline half is what makes the project pleasant
-to hack on — anyone can clone it and run everything in seconds. But it stubs the storage
-layer, which means it cannot see SQL: `PGvectorStore`, `ChromaStore`, `PGKBRegistry` and
-`BGEEmbeddings` were never referenced by a single offline test, and a PostgreSQL-only bug
-(wrong parameter placeholders in the registry) survived to `main` with CI green. The
-contract half closes exactly that gap: both backends run **the same assertions** — KB/doc
-lifecycle, cascade deletes, cross-KB isolation, and cross-backend score-scale agreement
-around the refusal threshold. In CI a missing PostgreSQL is a **failure**, not a skip.
+| 变量 | 用途 |
+| --- | --- |
+| `DEEPSEEK_API_KEY`、`DEEPSEEK_MODEL`、`DEEPSEEK_BASE_URL` | LLM 服务凭证、模型和兼容 API 地址 |
+| `VECTOR_BACKEND` | 选择 `chroma` 或 `pgvector` |
+| `POSTGRES_DSN` | PostgreSQL 连接串，pgvector 模式使用 |
+| `REDIS_URL` | 缓存与异步摄取队列连接 |
+| `API_KEYS` | 逗号分隔的 API Key；留空关闭鉴权 |
+| `INGEST_MODE` | `sync` 同步索引；`queue` 使用 arq worker |
+| `MAX_UPLOAD_MB`、`RATE_LIMIT_RPS` | 上传大小与可选限流参数 |
 
-**Retrieval evaluation.** `scripts/gen_qa_set.py` builds a chunk-grounded QA set (each question is answerable only from a single chunk; 10% human spot-check), and `scripts/eval_recall.py` measures Recall@k for the hybrid retriever against a vector-only baseline:
+知识库和文档元数据表由注册中心初始化；仓库没有独立的 Alembic/Flyway 迁移命令。启用队列摄取时，请同时启动 Compose worker。
 
-- Recall@1 **87.4%** / Recall@3 **97.9%** / Recall@5 **98.2%** (n=334 rows over 80 unique gold chunks, hybrid) — full report in `data/qa_set/recall_report.json`
+## 开发命令
 
-**Generation quality.** `scripts/eval_ragas.py` scores generated answers with RAGAS:
+~~~bash
+python -m pip install -r requirements-dev.txt
+pytest tests -m "not contract" -q
+~~~
 
-- Faithfulness **94.1%**, answer relevancy **88.7%**, hallucination rate **5.9%** (n=100 head slice of the QA set, judged by the same model family that generates the answers) — full report in `data/qa_set/ragas_report.json`
+后端契约测试需要 PostgreSQL/pgvector 与 Redis：
 
-Both suites above are being reworked (stratified sampling, chunk-level de-duplication with confidence intervals, an independent judge model, a negative-query set for refusal rate, and committed bench reports); see tickets 21–28. Until then treat the numbers above as *measured but not yet methodology-clean*.
+~~~bash
+docker compose up -d
+pytest tests -m contract -q
+~~~
 
-## Design decisions
+CI 分别运行离线测试与真实存储后端契约测试。RAG 设计说明见 [docs/DESIGN.md](docs/DESIGN.md)。
 
-The rationale behind every major choice is written up in [docs/DESIGN.md](docs/DESIGN.md) (16 sections, 中文): LLM / embedding / vector-store selection, Chinese-aware chunking, why hybrid retrieval + RRF + rerank, the two-path refusal design, cache key design, the streaming event protocol, and the async concurrency latency write-up.
+## 部署说明
 
-## Notes and gotchas
-
-- **No web console in v0.6.** The service is API-first — the interactive Swagger UI at `/docs` is the interface; the curl recipes above cover the common flows.
-- **Zero-dependency local run.** `VECTOR_BACKEND=chroma` swaps PostgreSQL + Redis for a local SQLite registry and Chroma — no Docker required to try the pipeline.
-- **Contract tests are not skippable.** `pytest -m contract` needs `docker compose up -d`; in CI a missing PostgreSQL is a failure, not a skip — that gap is exactly what the contract half exists to close.
-- **Evaluation numbers are honest but not final.** Real measurements of the shipped pipeline, pending the methodology revision (tickets 21–28) — see the caveat at the top.
-- **Auth is opt-in.** With no `API_KEY` set, all `/v1` routes are open; health and metrics always stay open. Semantic cache is bypassed for multi-turn requests by design — follow-up answers are never served from cache.
-- **Windows paths.** The venv interpreter lives at `.venv\Scripts\python` on Windows versus `.venv/bin/python` elsewhere — the snippets above cover both.
-
-## Roadmap
-
-Mainstream-KB capabilities deliberately left out of v0.6, in priority order: async ingestion for large files, parent-child (small-to-big) chunking, Office-format parsing (docx/xlsx/pptx), per-KB access control, connector sync (web/Confluence/Feishu), and answer feedback loops.
-
-## Support
-
-Bugs, questions, and feature ideas: [open an issue](https://github.com/zeng-bohan/enterprise-rag-qa/issues). Bug reports should include reproduction steps and the relevant logs or response bodies.
-
-## Contributing
-
-This is a solo-maintained project. Issues for bugs and ideas are very welcome; for code changes, please open an issue first so the approach can be discussed before you invest time.
-
-## License
-
-[MIT](LICENSE)
+现有 Compose 文件负责 PostgreSQL、Redis 和 worker，不负责构建或启动 API。可以在宿主机运行 API；若要容器化 API，需要为服务补充对应的镜像构建和运行配置。将服务暴露到可信网络前，请配置 `API_KEYS`，并按实际环境设置上传限制与限流。
