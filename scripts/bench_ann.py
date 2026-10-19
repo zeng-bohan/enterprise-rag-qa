@@ -98,6 +98,33 @@ def exact_topk(matrix, queries, k, mask=None):
     return np.argsort(-sims, axis=1, kind="stable")[:, :k]
 
 
+def explain_node(conn, kb, vec: str, k=10) -> str:
+    """记录该模式实际走到的扫描节点。
+
+    为什么必须记：pgvector 的索引代价估算会随 `hnsw.ef_search` 变化，规划器可能在
+    "HNSW 索引扫描" 与 "kb_id bitmap/顺序扫描 + 精确排序" 之间切换。只看 mode 名字
+    会把「恰好走了精确计划」误读成「HNSW 在过滤下召回无损」—— 本报告第一次发布时
+    就踩了这个坑（详见 docs/EVALUATION.md 的 ANN 小节）。
+
+    只取主计划的子节点（2 空格缩进的 `->`）：更深的缩进属于 InitPlan 内部，
+    那里出现的 Seq Scan 不是这条查询的主路径。
+    """
+    if kb is None:
+        sql = f"EXPLAIN (ANALYZE) SELECT id FROM chunks ORDER BY embedding <=> %s::vector LIMIT {k}"
+        params = (vec,)
+    else:
+        sql = (
+            f"EXPLAIN (ANALYZE) SELECT id FROM chunks WHERE kb_id = %s"
+            f" ORDER BY embedding <=> %s::vector LIMIT {k}"
+        )
+        params = (kb, vec)
+    for raw in conn.execute(sql, params).fetchall():
+        line = raw[0]
+        if line.startswith("  ->"):
+            return line.strip().split("(")[0].replace("->", "").strip()
+    return "unknown"
+
+
 def measure(conn, queries, truth_ids, mode, kb, ef, k=10, enable_index=True):
     # SET 不接受绑定参数（Postgres 语法），只能用字面量；这里的值全部来自本脚本内部，
     # 不来自任何用户输入
@@ -107,8 +134,10 @@ def measure(conn, queries, truth_ids, mode, kb, ef, k=10, enable_index=True):
     if mode.startswith("hnsw"):
         conn.execute(f"SET hnsw.ef_search = {int(ef)}")
     lat, hits_at = [], []
+    first_vec = ""
     for q in queries:
         vec = "[" + ",".join(f"{x:.6f}" for x in q) + "]"
+        first_vec = first_vec or vec
         # 绑定顺序必须与 SQL 里占位符的出现顺序一致：过滤分支中 kb_id 先于向量
         if kb is None:
             sql = "SELECT id FROM chunks ORDER BY embedding <=> %s::vector LIMIT %s"
@@ -128,9 +157,10 @@ def measure(conn, queries, truth_ids, mode, kb, ef, k=10, enable_index=True):
         "p50_ms": round(statistics.median(lat) * 1000, 2),
         "p95_ms": round(statistics.quantiles(lat, n=20)[18] * 1000, 2),
         "recall@10": round(statistics.mean(hits_at), 4),
+        "plan_node": explain_node(conn, kb, first_vec, k),
     }
     print(f"  {row['mode']:<20} ef={str(row['ef_search']):>5} p50={row['p50_ms']:>7}ms "
-          f"p95={row['p95_ms']:>7}ms recall@10={row['recall@10']}")
+          f"p95={row['p95_ms']:>7}ms recall@10={row['recall@10']}  [{row['plan_node']}]")
     return row
 
 

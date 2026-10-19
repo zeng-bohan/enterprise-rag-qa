@@ -15,10 +15,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.config import settings
-from app.rag.chunker import split_documents
-from app.rag.document_loader import load_document
+from app.core.kb_version import bump_kb_version
+from app.rag.ingest import ingest_document
 from app.rag.pipeline import RAGPipeline
 from app.rag.registry import KBError
+
+
+def ingest_file(pipe, kb_id: str, path: Path) -> dict:
+    """登记并索引单个文件，失败时只留下一条 failed 记录。
+
+    旧写法先按 chunk 数登记、再写向量；写入失败后又 add_document 一次，
+    于是同一次失败在文档列表里出现两条记录，其中一条还声称自己有 chunk。
+    这里改成与 API / worker 相同的一次性流程：先登记 queued，再由
+    ingest_document 推进到 indexed 或 failed。
+    """
+    record = pipe.registry.add_document(kb_id, path.name, chunk_count=0, status="queued")
+    doc_id = record["doc_id"]
+    try:
+        return ingest_document(pipe.store, pipe.registry, kb_id, doc_id, path)
+    except Exception as exc:
+        pipe.registry.update_document(
+            kb_id, doc_id, status="failed", chunk_count=0, error=str(exc)[:500]
+        )
+        raise
 
 
 def main() -> None:
@@ -43,22 +62,21 @@ def main() -> None:
 
     if args.rebuild:
         for doc in pipe.registry.list_documents(kb_id):
-            pipe.store.delete_by_doc(doc["doc_id"])
+            pipe.store.delete_by_doc(doc["doc_id"], kb_id=kb_id)
         pipe.registry.delete_documents_of_kb(kb_id)
         pipe.retriever.invalidate(kb_id)
+        bump_kb_version(kb_id)  # 其他进程（API）也要重建各自的 BM25 索引
         print(f"[ingest] 已清空知识库「{kb_name}」")
 
     total_chunks = 0
     for f in files:
         try:
-            chunks = split_documents(load_document(f))
-            record = pipe.registry.add_document(kb_id, f.name, chunk_count=len(chunks))
-            pipe.store.add_documents(chunks, kb_id=kb_id, doc_id=record["doc_id"])
-            total_chunks += len(chunks)
-            print(f"[ingest] ✓ {f.name}: {len(chunks)} chunks (doc_id={record['doc_id'][:8]}…)")
+            record = ingest_file(pipe, kb_id, f)
         except Exception as exc:
-            pipe.registry.add_document(kb_id, f.name, chunk_count=0, status="failed", error=str(exc)[:500])
             print(f"[ingest] ✗ {f.name}: {exc}")
+            continue
+        total_chunks += record["chunk_count"]
+        print(f"[ingest] ✓ {f.name}: {record['chunk_count']} chunks (doc_id={record['doc_id'][:8]}…)")
     pipe.retriever.invalidate(kb_id)
     print(
         f"[ingest] 完成：知识库「{kb_name}」共 {total_chunks} chunks，"

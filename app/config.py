@@ -36,21 +36,25 @@ class Settings(BaseSettings):
     # 默认 none（精确顺序扫描）—— 这是**测出来的结论，不是怕麻烦**。
     # 50000 行 × 512 维、8 个知识库（data/bench/ann_report.json，可复跑）：
     #
-    #   模式                      ef_search   p50 延迟    recall@10
-    #   顺序扫描（全局精确）          —         107.4ms      1.000
-    #   顺序扫描 + kb_id 过滤         —          17.1ms      1.000   ← 生产实际走的那条
-    #   HNSW（无过滤）               100         3.5ms      0.177
-    #   HNSW（无过滤）              1000        16.7ms      0.764
-    #   HNSW + kb_id 过滤           100        14.8ms      1.000
+    #   模式                      ef_search   计划         p50 延迟    recall@10
+    #   顺序扫描（全局精确）          —        Sort          99.8ms      1.000
+    #   顺序扫描 + kb_id 过滤         —        Sort          16.1ms      1.000   ← 生产实际走的那条
+    #   HNSW（无过滤）               100      Index Scan     3.3ms      0.182
+    #   HNSW（无过滤）              1000      Index Scan    15.1ms      0.765
+    #   HNSW + kb_id 过滤            40      Sort           13.4ms      1.000   ← 规划器没走 HNSW
+    #   HNSW + kb_id 过滤           100      Sort           13.9ms      1.000   ← 规划器没走 HNSW
+    #   HNSW + kb_id 过滤           200      Index Scan     4.8ms      0.285
+    #   HNSW + kb_id 过滤          1000      Index Scan    15.8ms      0.739
     #
     # 三点结论：
-    # 1. 本服务的检索**永远带 WHERE kb_id**，kb_id 上的 btree 先把候选缩到 1/8，
-    #    再排序取 top-k —— 17ms 且完全精确。加 HNSW 在这个量级上一点便宜没占到。
-    # 2. HNSW 在 pgvector 默认 ef_search=100 下把召回打到 0.177。对一个以引用溯源为
-    #    卖点的系统，"快 30 倍但静默丢掉八成正确 chunk"不是优化，是故障。
-    # 3. ef_search 的合法上限是 1000，也就是说**没法靠无限加大 ef 换回召回**。
+    # 1. 本服务的检索**永远带 WHERE kb_id**，这个量级下精确过滤扫描 16ms 且召回 1.0，
+    #    HNSW 没占到便宜。
+    # 2. 真正走 HNSW 且带过滤时，召回到 ef=1000 也只有 0.739。过滤会剪断图上的候选，
+    #    靠调大 ef 补不回来。
+    # 3. 规划器会随 ef_search 在 HNSW 与精确计划之间切换，所以测召回时必须同时记录
+    #    实际执行计划，否则会把精确计划的成绩记在 HNSW 头上。
     #
-    # 什么时候该开：单个知识库内 chunk 数远超 ~10 万、且能接受先复测 recall 时。
+    # 什么时候该开：单个知识库内 chunk 数远超当前量级、且能接受先复测 recall 时。
     # 开关后请务必复跑 scripts/bench_ann.py 并同步更新上面的表。
     ann_index: str = "none"
     # HNSW 建索引参数（m=16 / ef_construction=64 是 pgvector 推荐的通用起点）

@@ -1,0 +1,6 @@
+# 评测依赖（按需安装，不进运行时依赖）
+# 运行 scripts/eval_ragas.py 需要：
+#   pip install -r requirements.txt -r requirements-eval.txt
+# 另外需要一个可用的 DEEPSEEK_API_KEY（评测会真实调用模型，产生费用）。
+ragas>=0.4
+openai>=1.0

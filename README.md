@@ -1,148 +1,179 @@
-# 企业知识库 RAG 问答
+<p align="center">
+  <img src="docs/banner.svg" width="800" alt="Enterprise Knowledge-base RAG Q&A" />
+</p>
 
-基于 FastAPI 的文档问答服务，支持多知识库管理、文档索引、混合检索、引用回答和流式对话。项目提供 Chroma 本地模式与 PostgreSQL/pgvector 部署配置。
+<h1 align="center">Enterprise Knowledge-base RAG Q&A</h1>
 
-## 功能
+<p align="center">
+  A FastAPI service for document-grounded question answering: multiple knowledge bases, hybrid retrieval, cited answers, SSE streaming and multi-turn chat.
+</p>
 
-- 管理多个知识库和文档；支持 PDF、Markdown、TXT 上传、删除和文档到切片的来源追踪。
-- 使用 BM25 与向量检索召回，经过 RRF 融合和 Cross-Encoder 重排后生成回答。
-- 支持多轮对话、引用、低相关度拒答、语义缓存和 SSE 流式输出。
-- 支持 Chroma 与 pgvector 向量后端；元数据可使用 SQLite 或 PostgreSQL，Redis 用于缓存与可选的异步摄取。
-- 可选 API Key 鉴权、请求限流和 Prometheus 指标。
+<p align="center">
+  English | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-## 技术栈
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+[![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
+![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
 
-| 范围 | 技术 |
-| --- | --- |
-| 服务与 API | Python、FastAPI、Uvicorn、Pydantic Settings |
-| RAG 与模型 | LangChain、DeepSeek 兼容 API、FastEmbed/ONNX、BM25、Cross-Encoder |
-| 存储 | Chroma 或 PostgreSQL/pgvector；SQLite 元数据；可选 Redis |
-| 运行与验证 | Docker Compose、pytest、GitHub Actions |
+The service is API-first. Every capability is a REST endpoint, with interactive Swagger at `/docs`. There is no web console in this version.
 
-CI 使用 Python 3.12。向量化与重排模型在本机运行；首次使用时可能需要下载模型文件。
+## What it does
 
-## 处理流程
+- Manages knowledge bases and documents. Uploads support PDF, Markdown and TXT; every chunk carries `kb_id` and `doc_id` lineage, so deleting a document or a knowledge base removes its chunks as well.
+- Retrieves with BM25 (jieba segmentation) and vector search in parallel, fuses the two rankings with RRF, then reranks the top candidates with a cross-encoder.
+- Refuses to answer in two places: before generation when nothing is relevant, and after reranking when every candidate falls below the relevance floor. A refusal does not call the LLM.
+- Answers with numbered citations. Supports SSE streaming (`citations` → `token*` → `done`) and multi-turn chat, where follow-up questions are condensed into standalone queries before retrieval.
+- Offers two storage profiles behind one interface: PostgreSQL + pgvector, or Chroma + a SQLite metadata registry for local use. Switch with `VECTOR_BACKEND`.
+- Exposes Prometheus metrics, optional API-key auth and an approximate token-bucket rate limit.
 
-~~~mermaid
+## Architecture
+
+```mermaid
 flowchart LR
-    D[PDF / Markdown / TXT] --> P[解析与切片]
-    P --> V[向量索引与文档元数据]
-    Q[问题] --> R[BM25 + 向量召回]
-    V --> R
-    R --> F[RRF 融合与重排]
-    F --> L[LLM 生成]
-    L --> A[回答与引用 / SSE]
-~~~
+    subgraph Management
+        U["upload / delete"] --> API["/v1/kbs<br/>/v1/kbs/{id}/documents"]
+        API --> REG["KB registry<br/>PG tables or SQLite"]
+        API --> VS["Vector store<br/>pgvector or Chroma"]
+    end
 
-## 项目结构
+    subgraph Query
+        Q["/v1/chat<br/>/v1/chat/stream"] --> C["condense<br/>(multi-turn only)"]
+        C --> RW["query rewrite<br/>keyword path"]
+        C --> VEC["vector recall"]
+        RW --> BM["BM25 recall"]
+        BM --> F["RRF fusion"]
+        VEC --> F
+        F --> RR["cross-encoder rerank"]
+        RR --> G["refusal floor"]
+        G --> L["LLM generation<br/>with citations"]
+    end
 
-~~~text
-app/
-├── api/       # 对话、知识库与文档 API
-├── core/      # 配置、LLM、缓存、鉴权、指标与执行器
-└── rag/       # 文档解析、切片、索引、检索与生成
-data/
-├── docs/      # 随仓库提供的示例文档
-└── qa_set/    # 评测数据与报告
-scripts/       # 导入、提问与评测工具
-tests/         # 离线测试与存储后端契约测试
-docs/DESIGN.md # 主要设计决策
-docker-compose.yml
-.env.example
-~~~
+    L --> A["JSON or SSE"]
+```
 
-## 快速开始
+## Evaluation status
 
-### 本地模式
+Both reports were produced by running the pipeline in this repository. Both have limits worth knowing before you read the numbers.
 
-本地模式使用 Chroma 和 SQLite，不需要启动 PostgreSQL 或 Redis。
+| Measurement | Result | Scope |
+| --- | --- | --- |
+| Retrieval Recall@1 / @3 / @5 | 87.4% / 97.9% / 98.2% | 334 question rows over 80 distinct gold chunks, row-level |
+| RAGAS Faithfulness | 94.1% | 100 rows, all from one source document, judged by the same model family that generated the answers |
+| RAGAS Answer relevancy | 88.7% | same sample |
 
-~~~bash
+The recall set is synthetic: each question was generated from the chunk it is scored against, so it is easier than real user questions. The RAGAS sample covers 24 unique chunks from a single document, and its judge shares a model family with the generator, so self-evaluation bias cannot be ruled out. Treat both as measurements of this pipeline on this corpus, not as system-wide quality claims.
+
+The ANN benchmark is a separate, reproducible experiment. It found that an exact scan filtered by `kb_id` is fast enough at the tested scale, while HNSW loses recall under the same filter. `ANN_INDEX` therefore defaults to `none`. The benchmark records the execution plan for every measurement, because the planner can switch between HNSW and an exact plan depending on `ef_search`.
+
+Method, reproduction commands and a list of limits: [docs/EVALUATION.md](docs/EVALUATION.md).
+
+## Quick start
+
+### Local mode, no Docker
+
+```bash
 python -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+.venv/Scripts/python -m pip install -r requirements.txt   # Windows
+.venv/bin/python -m pip install -r requirements.txt       # macOS / Linux
 cp .env.example .env
-~~~
+```
 
-在 `.env` 中设置：
+Windows `cmd` uses `copy .env.example .env` and PowerShell uses `Copy-Item .env.example .env`; the command above works in Git Bash, macOS and Linux.
 
-~~~dotenv
-VECTOR_BACKEND=chroma
-DEEPSEEK_API_KEY=<你的模型 API Key>
-~~~
+Set `VECTOR_BACKEND=chroma` and `DEEPSEEK_API_KEY` in `.env`. This profile uses Chroma plus a local SQLite registry and does not need PostgreSQL or Redis.
 
-模型 API Key 用于生成回答；没有可用 Key 时服务仍可启动，但无法完成真实 LLM 回答。随后导入仓库中的示例文档并启动 API：
+```bash
+.venv/Scripts/python scripts/ingest_docs.py
+.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
-~~~bash
-python scripts/ingest_docs.py
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-~~~
+On macOS or Linux, replace the interpreter with `.venv/bin/python`.
 
-打开 [API 文档](http://127.0.0.1:8000/docs)。Windows PowerShell 可将激活命令替换为 `.venv\Scripts\Activate.ps1`，并用 `Copy-Item .env.example .env` 复制配置文件。
+The first run downloads the embedding model (about 95 MB) and, when reranking is used, the reranker (about 1.1 GB) into the fastembed cache. Both run locally through ONNX Runtime.
 
-### PostgreSQL 与 Redis
+### PostgreSQL and Redis
 
-`docker compose up -d` 会启动 PostgreSQL、Redis 和摄取 worker；Compose 不包含 FastAPI 服务本身。使用 pgvector 时，在 `.env` 中设置 `VECTOR_BACKEND=pgvector`，并确认 `POSTGRES_DSN` 与 `REDIS_URL` 指向本机映射端口，然后在宿主机运行上面的 Uvicorn 命令。
+```bash
+docker compose up -d
+```
 
-同步摄取是默认模式。使用队列时，API 与 worker 两侧都要设置 `INGEST_MODE=queue`。
+This starts PostgreSQL with pgvector, Redis, and an ingestion worker. It does not start the API. Set `VECTOR_BACKEND=pgvector` and make sure `POSTGRES_DSN` and `REDIS_URL` point at the mapped ports, then run the Uvicorn command above on the host.
+
+Ingestion is synchronous by default. For queued ingestion, set `INGEST_MODE=queue` on both the API and the worker.
 
 ## API
 
-| 方法 | 路径 | 用途 |
+| Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/v1/chat` | 普通问答，支持知识库和对话历史 |
-| POST | `/v1/chat/stream` | SSE 流式问答 |
-| POST | `/v1/kbs` | 创建知识库 |
-| GET | `/v1/kbs` | 列出知识库 |
-| DELETE | `/v1/kbs/{kb_id}` | 删除知识库及其内容 |
-| POST | `/v1/kbs/{kb_id}/documents` | 上传文档 |
-| GET | `/v1/kbs/{kb_id}/documents` | 列出知识库文档 |
-| DELETE | `/v1/kbs/{kb_id}/documents/{doc_id}` | 删除文档及其切片 |
-| POST | `/v1/retrieval-test` | 只检索、不生成，用于检查召回结果 |
-| GET | `/health`、`/metrics` | 健康检查和 Prometheus 指标 |
+| POST | `/v1/chat` | Answer a question; accepts `kb_id` and `history` |
+| POST | `/v1/chat/stream` | Same, as SSE |
+| POST | `/v1/kbs` | Create a knowledge base |
+| GET | `/v1/kbs` | List knowledge bases with document and chunk counts |
+| DELETE | `/v1/kbs/{kb_id}` | Delete a knowledge base and its chunks |
+| POST | `/v1/kbs/{kb_id}/documents` | Upload and index a document |
+| GET | `/v1/kbs/{kb_id}/documents` | List documents |
+| DELETE | `/v1/kbs/{kb_id}/documents/{doc_id}` | Delete a document and its chunks |
+| POST | `/v1/retrieval-test` | Retrieval only, without generation |
+| GET | `/health`, `/metrics` | Health check and Prometheus metrics |
 
-启用 `API_KEYS` 后，`/v1` 业务接口需通过 `X-API-Key` 请求头鉴权；未配置时不启用鉴权。`/health` 与 `/metrics` 始终开放。完整交互文档可在服务启动后通过 `/docs` 查看。
+When `API_KEYS` is set, every `/v1` route requires `X-API-Key`. `/health` and `/metrics` stay open.
 
-示例问答：
-
-~~~bash
+```bash
 curl -X POST http://127.0.0.1:8000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"question":"员工请年假需要提前几天申请？"}'
-~~~
+```
 
-## 配置
+## Tests
 
-配置从仓库根目录的 `.env` 读取；完整字段和默认值见 [.env.example](.env.example)。
+The suite has two halves.
 
-| 变量 | 用途 |
-| --- | --- |
-| `DEEPSEEK_API_KEY`、`DEEPSEEK_MODEL`、`DEEPSEEK_BASE_URL` | LLM 服务凭证、模型和兼容 API 地址 |
-| `VECTOR_BACKEND` | 选择 `chroma` 或 `pgvector` |
-| `POSTGRES_DSN` | PostgreSQL 连接串，pgvector 模式使用 |
-| `REDIS_URL` | 缓存与异步摄取队列连接 |
-| `API_KEYS` | 逗号分隔的 API Key；留空关闭鉴权 |
-| `INGEST_MODE` | `sync` 同步索引；`queue` 使用 arq worker |
-| `MAX_UPLOAD_MB`、`RATE_LIMIT_RPS` | 上传大小与可选限流参数 |
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
 
-知识库和文档元数据表由注册中心初始化；仓库没有独立的 Alembic/Flyway 迁移命令。启用队列摄取时，请同时启动 Compose worker。
-
-## 开发命令
-
-~~~bash
-python -m pip install -r requirements-dev.txt
-pytest tests -m "not contract" -q
-~~~
-
-后端契约测试需要 PostgreSQL/pgvector 与 Redis：
-
-~~~bash
+pytest tests -m "not contract" -q      # 127 offline tests, no database, no model downloads
 docker compose up -d
-pytest tests -m contract -q
-~~~
+RAG_CONTRACT_STRICT=1 pytest tests -m contract -q   # 42 contract tests against real backends
+```
 
-CI 分别运行离线测试与真实存储后端契约测试。RAG 设计说明见 [docs/DESIGN.md](docs/DESIGN.md)。
+The offline half stubs the LLM, reranker, vector store, registry and cache, so it runs in seconds and covers orchestration, refusal, caching, streaming and concurrency. It cannot see SQL. The contract half runs the same assertions against PostgreSQL/pgvector and Chroma: lifecycle, cascade deletion, per-KB isolation and score-scale parity. In CI, a missing PostgreSQL fails the job instead of skipping it.
 
-## 部署说明
+CI also runs both halves on Python 3.12.
 
-现有 Compose 文件负责 PostgreSQL、Redis 和 worker，不负责构建或启动 API。可以在宿主机运行 API；若要容器化 API，需要为服务补充对应的镜像构建和运行配置。将服务暴露到可信网络前，请配置 `API_KEYS`，并按实际环境设置上传限制与限流。
+## Project layout
+
+```text
+app/
+├── main.py              FastAPI app and lifespan
+├── config.py            pydantic-settings configuration
+├── api/                 chat, knowledge-base management, error translation
+├── core/                auth, cache, embeddings, executor, metrics, queue, versioning
+└── rag/                 loader, chunker, BM25, vector store, retriever, reranker,
+                         generator, pipeline, registry, ingestion
+scripts/                 ingestion, CLI questions, evaluation and benchmarks
+tests/                   offline tests
+tests/contract/          dual-backend contract tests
+data/docs/               sample corpus
+data/qa_set/, data/bench evaluation sets and reports
+docs/                    design decisions, evaluation method, technical highlights
+```
+
+## Design notes
+
+- [docs/DESIGN.md](docs/DESIGN.md): 17 design decisions, including model and store choices, chunking, hybrid retrieval, refusal, cache keys, streaming protocol and the ANN measurement.
+- [docs/TECHNICAL_HIGHLIGHTS.md](docs/TECHNICAL_HIGHLIGHTS.md): what each subsystem solves, where the code is, how to verify it, and what it does not handle.
+- [docs/EVALUATION.md](docs/EVALUATION.md): evaluation method, sample composition, known biases and what is still unverified.
+
+## Limitations
+
+- BM25 indexes are built in process memory and rebuilt in full after a knowledge-base change. Large knowledge bases will see a latency spike on the first query after ingestion.
+- The local profile (Chroma + SQLite) has no cross-engine transaction. A failed ingestion is compensated by marking the document `failed`, which can leave a short window where metadata and chunks disagree.
+- Retrieval thresholds and ANN settings are tuned for the corpus in `data/docs`. Different corpora need re-measurement.
+- There is no document-level access control. API keys gate the whole service, not individual knowledge bases.
+- PDF text extraction needs an embedded text layer. Scanned PDFs and PDFs with fonts that lack a ToUnicode map will produce garbled or empty text; the ingestion path reports the failure instead of indexing noise.
+- The rate limiter is an approximate per-second counter in Redis. It is meant to stop obvious abuse, not to enforce precise quotas.
+
+## License
+
+[MIT](LICENSE)

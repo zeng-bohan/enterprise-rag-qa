@@ -17,7 +17,9 @@ chunk 本体在向量库（含 kb_id / doc_id 血缘元数据），本模块管�
 """
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -36,6 +38,25 @@ def _now() -> str:
 
 class KBError(RuntimeError):
     """知识库不存在 / 重名等业务错误，message 面向 API 直接返回。"""
+
+
+def _serialized(method):
+    """把方法整体放进同一把可重入锁（仅 SQLite 实现使用）。
+
+    sqlite3 连接的 `execute + commit` 是两步，GIL 只保证单步原子。管理接口把这些
+    方法丢进 4 线程的元数据池，并发建库时两个线程会先后的 execute 卷进同一个隐式
+    事务，先 commit 的那个把两条记录一起提交，后一个再 commit 就抛
+    「cannot commit - no transaction is active」或 InterfaceError。
+    用锁把「写 + 提交」包成一个临界区；RLock 是因为 ensure_default / delete_kb /
+    update_document 会调用同类中被装饰的方法。
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class BackendError(RuntimeError):
@@ -137,6 +158,7 @@ class SQLiteKBRegistry(KBRegistry):
     """本地模式：单文件 SQLite（stdlib，无新依赖）。"""
 
     def __init__(self, path: str) -> None:
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -170,12 +192,14 @@ class SQLiteKBRegistry(KBRegistry):
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_kb ON documents(kb_id)")
         self._conn.commit()
 
+    @_serialized
     def ensure_default(self) -> str:
         kb_id = self.kb_id_by_name(settings.default_kb)
         if kb_id:
             return kb_id
         return self.create_kb(settings.default_kb, "默认知识库（脚本入库 / 单库问答）")["kb_id"]
 
+    @_serialized
     def create_kb(self, name: str, description: str = "") -> dict:
         kb_id = uuid.uuid4().hex[:12]
         now = _now()
@@ -189,26 +213,31 @@ class SQLiteKBRegistry(KBRegistry):
             raise KBError(f"知识库名已存在: {name}") from exc
         return {"kb_id": kb_id, "name": name, "description": description, "created_at": now}
 
+    @_serialized
     def list_kbs(self) -> List[dict]:
         rows = self._conn.execute("SELECT kb_id, name, description, created_at FROM kbs ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
 
+    @_serialized
     def get_kb(self, kb_id: str) -> dict:
         row = self._conn.execute("SELECT kb_id, name, description, created_at FROM kbs WHERE kb_id = ?", (kb_id,)).fetchone()
         if row is None:
             raise KBError(f"知识库不存在: {kb_id}")
         return dict(row)
 
+    @_serialized
     def kb_id_by_name(self, name: str) -> Optional[str]:
         row = self._conn.execute("SELECT kb_id FROM kbs WHERE name = ?", (name,)).fetchone()
         return row["kb_id"] if row else None
 
+    @_serialized
     def delete_kb(self, kb_id: str) -> None:
         self.get_kb(kb_id)  # 不存在则抛 KBError
         self._conn.execute("DELETE FROM documents WHERE kb_id = ?", (kb_id,))
         self._conn.execute("DELETE FROM kbs WHERE kb_id = ?", (kb_id,))
         self._conn.commit()
 
+    @_serialized
     def add_document(
         self, kb_id: str, filename: str, chunk_count: int, status: str = "indexed", error: str = ""
     ) -> dict:
@@ -232,6 +261,7 @@ class SQLiteKBRegistry(KBRegistry):
             "updated_at": now,
         }
 
+    @_serialized
     def list_documents(self, kb_id: str) -> List[dict]:
         rows = self._conn.execute(
             "SELECT doc_id, filename, status, chunk_count, error, created_at, updated_at"
@@ -242,6 +272,7 @@ class SQLiteKBRegistry(KBRegistry):
         # 否则与 PG 后端的返回形状不一致——契约测试 first-run 抓到的就是这条
         return [{**dict(r), "kb_id": kb_id} for r in rows]
 
+    @_serialized
     def get_document(self, kb_id: str, doc_id: str) -> dict:
         row = self._conn.execute(
             "SELECT doc_id, filename, status, chunk_count, error, created_at, updated_at"
@@ -252,15 +283,18 @@ class SQLiteKBRegistry(KBRegistry):
             raise KBError(f"文档不存在: {doc_id}")
         return {**dict(row), "kb_id": kb_id}
 
+    @_serialized
     def delete_document(self, kb_id: str, doc_id: str) -> None:
         self.get_document(kb_id, doc_id)
         self._conn.execute("DELETE FROM documents WHERE kb_id = ? AND doc_id = ?", (kb_id, doc_id))
         self._conn.commit()
 
+    @_serialized
     def delete_documents_of_kb(self, kb_id: str) -> None:
         self._conn.execute("DELETE FROM documents WHERE kb_id = ?", (kb_id,))
         self._conn.commit()
 
+    @_serialized
     def document_counts(self) -> dict:
         # 必须给 count(*) 起别名：sqlite3.Row 用列名索引，而无列名的聚合表达式取不到
         # （写成 r["1"] 会 IndexError）。这条只有真正执行过才会暴露。
@@ -269,6 +303,7 @@ class SQLiteKBRegistry(KBRegistry):
         ).fetchall()
         return {r["kb_id"]: r["n"] for r in rows}
 
+    @_serialized
     def update_document(
         self, kb_id: str, doc_id: str, status: str, chunk_count: Optional[int] = None, error: str = ""
     ) -> dict:
@@ -281,7 +316,6 @@ class SQLiteKBRegistry(KBRegistry):
         )
         self._conn.commit()
         return self.get_document(kb_id, doc_id)
-
 
 class PGKBRegistry(KBRegistry):
     """生产模式：PostgreSQL（与 chunks 同库，连接池复用 store 的配置）。"""
