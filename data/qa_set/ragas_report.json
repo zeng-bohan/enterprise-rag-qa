@@ -1,6 +1,26 @@
 {
   "n": 100,
-  "faithfulness": 0.941,
-  "answer_relevancy": 0.8865,
-  "hallucination_rate": 0.059
+  "faithfulness": 0.9327,
+  "answer_relevancy": 0.8929,
+  "hallucination_rate": 0.0673,
+  "judge_model": "deepseek-chat",
+  "generator_model": "deepseek-chat",
+  "embedding_model": "BAAI/bge-small-zh-v1.5",
+  "sampling": "stratified",
+  "sample_composition": {
+    "rows": 100,
+    "unique_gold_chunks": 25,
+    "sources": {
+      "中华人民共和国劳动合同法.txt": 16,
+      "中华人民共和国社会保险法.txt": 16,
+      "住房公积金管理条例.txt": 16,
+      "女职工劳动保护特别规定.txt": 16,
+      "员工手册.md": 12,
+      "信息安全管理制度.md": 8,
+      "考勤与请假管理制度.pdf": 8,
+      "财务报销管理制度.md": 8
+    }
+  },
+  "zero_context_rows": 2,
+  "measured_at": "2026-10-19 16:57:57"
 }

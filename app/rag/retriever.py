@@ -15,7 +15,7 @@ v0.6 多知识库语义：
 - v3 多知识库：单库 BM25 全局索引 → 按 kb 惰性索引 + 失效通知。
 """
 import asyncio
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 
@@ -55,23 +55,47 @@ class HybridRetriever:
         store: "ChromaStore | PGvectorStore",
         rewriter: Optional[QueryRewriter] = None,
         reranker: Optional[CrossEncoderReranker] = None,
+        default_kb_resolver: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
-        """rewriter / reranker 可注入（与 pipeline.py 的约定一致）。
+        """rewriter / reranker / 默认库解析器都可注入。
 
-        为什么这是必须的而不只是"更干净"：两者默认实现都要碰外部世界——
-        QueryRewriter 构造时建 LLM 客户端，CrossEncoderReranker 构造时去 HuggingFace
-        拉 ~1.1GB 模型。测试想替换其中一个，就得先成功构造另一个，于是：
-        离线用例在没有凭据的机器上直接抛 Missing credentials，或整轮挂死在下载上。
-        两个都由调用方给定时，构造过程不触碰任何网络。
+        rewriter 与 reranker 默认实现都要碰外部世界：QueryRewriter 构造时建 LLM
+        客户端，CrossEncoderReranker 构造时去 HuggingFace 拉 ~1.1GB 模型。测试想
+        替换其中一个，就得先成功构造另一个。两个都由调用方给定时，构造过程不触碰
+        任何网络。
+
+        default_kb_resolver 把「DEFAULT_KB 名称 → 知识库 ID」的查询交给调用方：
+        chunk 里存的是注册中心分配的 ID，而配置里是名称。检索层如果自己去 new
+        注册中心，单测会意外连库；由 Pipeline 注入已经建好的注册中心最省事。
         """
         self._store = store
         self._rewriter = rewriter if rewriter is not None else QueryRewriter()
         self._reranker = reranker if reranker is not None else CrossEncoderReranker()
+        self._default_kb_resolver = default_kb_resolver
         # 每知识库一个 BM25 索引，惰性构建，并记录构建时的 kb 版本。
         # 带版本而不是只靠 invalidate()（工单 13）：摄取移进 worker 进程后，
         # 写入方再也调用不到本进程的 invalidate()，只靠进程内信号就会永久失效。
         self._bm25_cache: Dict[str, Tuple[BM25Index, int]] = {}
         self._versions = KBVersionTracker()
+        self._default_kb_id: Optional[str] = None
+
+    def _resolve_default_kb(self) -> str:
+        """把 DEFAULT_KB（名称）解析成知识库 ID，解析一次并缓存。
+
+        chunk 里存的是注册中心分配的 ID，`settings.default_kb` 是名称。以前检索层
+        直接拿名称当 kb_id 过滤，脚本和未带 kb_id 的请求永远查不到任何 chunk
+        （表现为全量拒答）。默认库 ID 在进程生命周期内不变，因此缓存结果。
+        """
+        if self._default_kb_id is not None:
+            return self._default_kb_id
+        kb_id = None
+        if self._default_kb_resolver is not None:
+            try:
+                kb_id = self._default_kb_resolver()
+            except Exception:  # noqa: BLE001 - 解析失败退回旧行为，不阻塞检索
+                kb_id = None
+        self._default_kb_id = kb_id or settings.default_kb
+        return self._default_kb_id
 
     def invalidate(self, kb_id: Optional[str] = None) -> None:
         """文档 / 知识库变更后使 BM25 索引失效（None = 全部失效）。
@@ -128,7 +152,7 @@ class HybridRetriever:
         top_k: Optional[int] = None,
         threshold: Optional[float] = None,
     ) -> List[Tuple[Document, float]]:
-        kb = kb_id or settings.default_kb
+        kb = kb_id or self._resolve_default_kb()
         k = top_k or settings.retrieval_top_k
         vec_floor = threshold if threshold is not None else settings.score_threshold
 
@@ -162,7 +186,7 @@ class HybridRetriever:
         检索白等一次 LLM 往返（实测约 1s）。gather 之后这条路径的墙钟时间从
         「改写 + 两路检索」降成「max(改写 + BM25, 向量)」。
         """
-        kb = kb_id or settings.default_kb
+        kb = kb_id or self._resolve_default_kb()
         k = top_k or settings.retrieval_top_k
         vec_floor = threshold if threshold is not None else settings.score_threshold
 

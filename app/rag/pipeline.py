@@ -11,6 +11,7 @@
 import time
 from typing import AsyncIterator, Dict, List, Optional
 
+from app.config import settings
 from app.core.cache import get_cache
 from app.core.metrics import INFLIGHT, LATENCY
 from app.rag.generator import (
@@ -30,7 +31,16 @@ class RAGPipeline:
         self.store = store if store is not None else get_store()
         self.registry = registry if registry is not None else get_registry()
         self.cache = cache if cache is not None else get_cache()
-        self.retriever = HybridRetriever(self.store)
+        self.retriever = HybridRetriever(
+            self.store, default_kb_resolver=self._default_kb_id
+        )
+
+    def _default_kb_id(self) -> Optional[str]:
+        """DEFAULT_KB 是名称，chunk 里存的是注册中心分配的 ID。"""
+        try:
+            return self.registry.kb_id_by_name(settings.default_kb)
+        except Exception:  # noqa: BLE001 - 注册中心不可用时退回名称，不阻塞启动
+            return None
 
     # ---------- 非流式 ----------
 

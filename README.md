@@ -1,76 +1,76 @@
 <p align="center">
-  <img src="docs/banner.svg" width="800" alt="Enterprise Knowledge-base RAG Q&A" />
+  <img src="docs/banner.svg" width="800" alt="企业知识库 RAG 问答" />
 </p>
 
-<h1 align="center">Enterprise Knowledge-base RAG Q&A</h1>
+<h1 align="center">企业知识库 RAG 问答</h1>
 
 <p align="center">
-  A FastAPI service for document-grounded question answering: multiple knowledge bases, hybrid retrieval, cited answers, SSE streaming and multi-turn chat.
+  基于 FastAPI 的文档问答服务：多知识库、混合检索、引用溯源、SSE 流式与多轮对话。
 </p>
 
 <p align="center">
-  English | <a href="README.zh-CN.md">简体中文</a>
+  简体中文 | <a href="README.en.md">English</a>
 </p>
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 [![CI](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml/badge.svg)](https://github.com/zeng-bohan/enterprise-rag-qa/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/License-MIT-4EB1BA?style=flat-square)
 
-The service is API-first. Every capability is a REST endpoint, with interactive Swagger at `/docs`. There is no web console in this version.
+服务以 API 为先，所有能力都通过 REST 端点提供，交互式文档在 `/docs`。当前版本没有 Web 控制台。
 
-## What it does
+## 功能
 
-- Manages knowledge bases and documents. Uploads support PDF, Markdown and TXT; every chunk carries `kb_id` and `doc_id` lineage, so deleting a document or a knowledge base removes its chunks as well.
-- Retrieves with BM25 (jieba segmentation) and vector search in parallel, fuses the two rankings with RRF, then reranks the top candidates with a cross-encoder.
-- Refuses to answer in two places: before generation when nothing is relevant, and after reranking when every candidate falls below the relevance floor. A refusal does not call the LLM.
-- Answers with numbered citations. Supports SSE streaming (`citations` → `token*` → `done`) and multi-turn chat, where follow-up questions are condensed into standalone queries before retrieval.
-- Offers two storage profiles behind one interface: PostgreSQL + pgvector, or Chroma + a SQLite metadata registry for local use. Switch with `VECTOR_BACKEND`.
-- Exposes Prometheus metrics, optional API-key auth and an approximate token-bucket rate limit.
+- 知识库与文档管理。支持 PDF、Markdown、TXT 上传，每个 chunk 都带 `kb_id` 与 `doc_id` 血缘，删除文档或知识库会一并清理对应 chunk。
+- 混合检索。BM25（jieba 分词）与向量检索并行召回，用 RRF 融合排名，再交给 Cross-Encoder 重排。BM25 用倒排表实现，查询只遍历包含查询词的 chunk。
+- 两处拒答。检索后没有任何相关命中时直接拒答，不调用生成模型；重排后所有候选都低于相关度下限时同样拒答。
+- 引用问答。回答标注编号，SSE 事件顺序为 `citations`、`token*`、`done`。多轮对话会先把追问改写成独立问题再检索。
+- 两种存储形态共用一个接口：PostgreSQL + pgvector，或 Chroma + SQLite 元数据注册中心。通过 `VECTOR_BACKEND` 切换。
+- Prometheus 指标、可选 API Key 鉴权、近似令牌桶限流。
 
-## Architecture
+## 架构
 
 ```mermaid
 flowchart LR
-    subgraph Management
-        U["upload / delete"] --> API["/v1/kbs<br/>/v1/kbs/{id}/documents"]
-        API --> REG["KB registry<br/>PG tables or SQLite"]
-        API --> VS["Vector store<br/>pgvector or Chroma"]
+    subgraph MGMT[管理面]
+        U["上传 / 删除"] --> API["/v1/kbs<br/>/v1/kbs/{id}/documents"]
+        API --> REG["注册中心<br/>PG 表或 SQLite"]
+        API --> VS["向量库<br/>pgvector 或 Chroma"]
     end
 
-    subgraph Query
-        Q["/v1/chat<br/>/v1/chat/stream"] --> C["condense<br/>(multi-turn only)"]
-        C --> RW["query rewrite<br/>keyword path"]
-        C --> VEC["vector recall"]
-        RW --> BM["BM25 recall"]
-        BM --> F["RRF fusion"]
+    subgraph QUERY[问答面]
+        Q["/v1/chat<br/>/v1/chat/stream"] --> C["问题压缩<br/>仅多轮"]
+        C --> RW["查询改写<br/>供关键词路"]
+        C --> VEC["向量召回"]
+        RW --> BM["BM25 召回"]
+        BM --> F["RRF 融合"]
         VEC --> F
-        F --> RR["cross-encoder rerank"]
-        RR --> G["refusal floor"]
-        G --> L["LLM generation<br/>with citations"]
+        F --> RR["Cross-Encoder 重排"]
+        RR --> G["拒答判定"]
+        G --> L["LLM 生成<br/>带引用"]
     end
 
-    L --> A["JSON or SSE"]
+    L --> A["JSON 或 SSE"]
 ```
 
-## Evaluation status
+## 评测现状
 
-Both reports were produced by running the pipeline in this repository. Both have limits worth knowing before you read the numbers.
+`data/` 下有三份评测报告，都是在本仓库跑出来的。数字与口径如下，完整说明见 [docs/EVALUATION.md](docs/EVALUATION.md)。
 
-| Measurement | Result | Scope |
+| 指标 | 结果 | 口径 |
 | --- | --- | --- |
-| Retrieval Recall@1 / @3 / @5 | 87.4% / 97.9% / 98.2% | 334 question rows over 80 distinct gold chunks, row-level |
-| RAGAS Faithfulness | 94.1% | 100 rows, all from one source document, judged by the same model family that generated the answers |
-| RAGAS Answer relevancy | 88.7% | same sample |
+| 检索 Recall@1 / @3 / @5（混合） | 87.43% / 97.01% / 97.90% | 334 行问题，覆盖 80 个唯一 gold chunk |
+| 检索 Recall@1 / @3 / @5（纯向量基线） | 66.17% / 88.92% / 95.21% | 同一批问题，只做向量检索 |
+| RAGAS Faithfulness | 93.27% | 分层抽样 100 行，覆盖 8 篇文档、25 个唯一 chunk |
+| RAGAS Answer relevancy | 89.29% | 同上 |
+| 负例拒答率 / 正例误拒率 | 90% / 4% | 20 条语料外问题，50 条语料内问题 |
 
-The recall set is synthetic: each question was generated from the chunk it is scored against, so it is easier than real user questions. The RAGAS sample covers 24 unique chunks from a single document, and its judge shares a model family with the generator, so self-evaluation bias cannot be ruled out. Treat both as measurements of this pipeline on this corpus, not as system-wide quality claims.
+召回评测集是合成的：问题由被评分的 chunk 正文生成，比真实用户提问容易。RAGAS 的评审模型与生成模型同族，自评偏差无法排除。负例集只有 20 条，拒答比例适合看趋势，不适合当作精确指标。这些数字描述的是这套管线在这批语料上的表现，不能当作系统整体质量。
 
-The ANN benchmark is a separate, reproducible experiment. It found that an exact scan filtered by `kb_id` is fast enough at the tested scale, while HNSW loses recall under the same filter. `ANN_INDEX` therefore defaults to `none`. The benchmark records the execution plan for every measurement, because the planner can switch between HNSW and an exact plan depending on `ef_search`.
+ANN 基准是另一组可复现实验。在 50000 行、8 个知识库的测试条件下，带 `kb_id` 过滤的精确扫描约 16ms 且召回 1.0；HNSW 在同样过滤下，真正走索引时召回随 `ef_search` 上升，到上限 1000 也只有 0.739。因此 `ANN_INDEX` 默认 `none`。基准会记录每次测量实际走到的执行计划，因为规划器会随 `ef_search` 在 HNSW 与精确计划之间切换。
 
-Method, reproduction commands and a list of limits: [docs/EVALUATION.md](docs/EVALUATION.md).
+## 快速开始
 
-## Quick start
-
-### Local mode, no Docker
+### 本地模式，不需要 Docker
 
 ```bash
 python -m venv .venv
@@ -79,45 +79,45 @@ python -m venv .venv
 cp .env.example .env
 ```
 
-Windows `cmd` uses `copy .env.example .env` and PowerShell uses `Copy-Item .env.example .env`; the command above works in Git Bash, macOS and Linux.
+Windows `cmd` 用 `copy .env.example .env`，PowerShell 用 `Copy-Item .env.example .env`；上面的写法适用于 Git Bash、macOS 与 Linux。
 
-Set `VECTOR_BACKEND=chroma` and `DEEPSEEK_API_KEY` in `.env`. This profile uses Chroma plus a local SQLite registry and does not need PostgreSQL or Redis.
+在 `.env` 中设置 `VECTOR_BACKEND=chroma` 和 `DEEPSEEK_API_KEY`。该形态使用 Chroma 加本地 SQLite 注册中心，不需要 PostgreSQL 与 Redis。
 
 ```bash
 .venv/Scripts/python scripts/ingest_docs.py
 .venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-On macOS or Linux, replace the interpreter with `.venv/bin/python`.
+macOS 或 Linux 将解释器换成 `.venv/bin/python`。
 
-The first run downloads the embedding model (about 95 MB) and, when reranking is used, the reranker (about 1.1 GB) into the fastembed cache. Both run locally through ONNX Runtime.
+首次启动会下载嵌入模型（约 95MB）与重排模型（约 1.1GB），都缓存在 fastembed 目录，通过 ONNX Runtime 在本机推理。嵌入模型下载失败会导致启动失败；重排模型失败时降级为不重排，服务仍可用。
 
-### PostgreSQL and Redis
+### PostgreSQL 与 Redis
 
 ```bash
 docker compose up -d
 ```
 
-This starts PostgreSQL with pgvector, Redis, and an ingestion worker. It does not start the API. Set `VECTOR_BACKEND=pgvector` and make sure `POSTGRES_DSN` and `REDIS_URL` point at the mapped ports, then run the Uvicorn command above on the host.
+会启动带 pgvector 的 PostgreSQL、Redis 和摄取 worker，不启动 API 本体。在 `.env` 中设置 `VECTOR_BACKEND=pgvector`，确认 `POSTGRES_DSN` 与 `REDIS_URL` 指向映射端口，然后在宿主机运行上面的 Uvicorn 命令。
 
-Ingestion is synchronous by default. For queued ingestion, set `INGEST_MODE=queue` on both the API and the worker.
+同步摄取是默认模式。使用队列时，API 与 worker 两侧都要设置 `INGEST_MODE=queue`。
 
 ## API
 
-| Method | Path | Purpose |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| POST | `/v1/chat` | Answer a question; accepts `kb_id` and `history` |
-| POST | `/v1/chat/stream` | Same, as SSE |
-| POST | `/v1/kbs` | Create a knowledge base |
-| GET | `/v1/kbs` | List knowledge bases with document and chunk counts |
-| DELETE | `/v1/kbs/{kb_id}` | Delete a knowledge base and its chunks |
-| POST | `/v1/kbs/{kb_id}/documents` | Upload and index a document |
-| GET | `/v1/kbs/{kb_id}/documents` | List documents |
-| DELETE | `/v1/kbs/{kb_id}/documents/{doc_id}` | Delete a document and its chunks |
-| POST | `/v1/retrieval-test` | Retrieval only, without generation |
-| GET | `/health`, `/metrics` | Health check and Prometheus metrics |
+| POST | `/v1/chat` | 问答，支持 `kb_id` 与 `history` |
+| POST | `/v1/chat/stream` | SSE 流式问答 |
+| POST | `/v1/kbs` | 创建知识库 |
+| GET | `/v1/kbs` | 列出知识库及文档、chunk 数 |
+| DELETE | `/v1/kbs/{kb_id}` | 删除知识库及其 chunk |
+| POST | `/v1/kbs/{kb_id}/documents` | 上传并索引文档 |
+| GET | `/v1/kbs/{kb_id}/documents` | 列出文档 |
+| DELETE | `/v1/kbs/{kb_id}/documents/{doc_id}` | 删除文档及其 chunk |
+| POST | `/v1/retrieval-test` | 只检索，不生成 |
+| GET | `/health`、`/metrics` | 健康检查与 Prometheus 指标 |
 
-When `API_KEYS` is set, every `/v1` route requires `X-API-Key`. `/health` and `/metrics` stay open.
+配置 `API_KEYS` 后，所有 `/v1` 路由需要 `X-API-Key`。`/health` 与 `/metrics` 始终开放。
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/chat \
@@ -125,55 +125,55 @@ curl -X POST http://127.0.0.1:8000/v1/chat \
   -d '{"question":"员工请年假需要提前几天申请？"}'
 ```
 
-## Tests
+## 测试
 
-The suite has two halves.
+测试分成两半。
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 
-pytest tests -m "not contract" -q      # 127 offline tests, no database, no model downloads
+pytest tests -m "not contract" -q      # 134 个离线用例，不连数据库、不下载模型
 docker compose up -d
-RAG_CONTRACT_STRICT=1 pytest tests -m contract -q   # 42 contract tests against real backends
+RAG_CONTRACT_STRICT=1 pytest tests -m contract -q   # 42 个契约用例，真实后端
 ```
 
-The offline half stubs the LLM, reranker, vector store, registry and cache, so it runs in seconds and covers orchestration, refusal, caching, streaming and concurrency. It cannot see SQL. The contract half runs the same assertions against PostgreSQL/pgvector and Chroma: lifecycle, cascade deletion, per-KB isolation and score-scale parity. In CI, a missing PostgreSQL fails the job instead of skipping it.
+离线套件打桩了 LLM、重排器、向量库、注册中心与缓存，十秒左右跑完，覆盖编排、拒答、缓存、流式与并发关系，但看不见 SQL。契约套件对 PostgreSQL/pgvector 与 Chroma 跑同一组断言，覆盖生命周期、级联删除、按库隔离与分数口径一致。CI 中缺少 PostgreSQL 会判失败，不会跳过。
 
-CI also runs both halves on Python 3.12.
+CI 在 Python 3.12 上运行这两组测试。
 
-## Project layout
+## 目录结构
 
 ```text
 app/
-├── main.py              FastAPI app and lifespan
-├── config.py            pydantic-settings configuration
-├── api/                 chat, knowledge-base management, error translation
-├── core/                auth, cache, embeddings, executor, metrics, queue, versioning
-└── rag/                 loader, chunker, BM25, vector store, retriever, reranker,
-                         generator, pipeline, registry, ingestion
-scripts/                 ingestion, CLI questions, evaluation and benchmarks
-tests/                   offline tests
-tests/contract/          dual-backend contract tests
-data/docs/               sample corpus
-data/qa_set/, data/bench evaluation sets and reports
-docs/                    design decisions, evaluation method, technical highlights
+├── main.py              FastAPI 应用与 lifespan
+├── config.py            pydantic-settings 配置
+├── api/                 问答、知识库管理、异常翻译
+├── core/                鉴权、缓存、嵌入、执行器、指标、队列、版本号
+└── rag/                 解析、切片、BM25、向量库、检索、重排、
+                         生成、编排、注册中心、摄取
+scripts/                 入库、命令行提问、评测与基准
+tests/                   离线测试
+tests/contract/          双后端契约测试
+data/docs/               示例语料
+data/qa_set/, data/bench 评测集与报告
+docs/                    设计决策、评测方法、技术导览
 ```
 
-## Design notes
+## 设计文档
 
-- [docs/DESIGN.md](docs/DESIGN.md): 17 design decisions, including model and store choices, chunking, hybrid retrieval, refusal, cache keys, streaming protocol and the ANN measurement.
-- [docs/TECHNICAL_HIGHLIGHTS.md](docs/TECHNICAL_HIGHLIGHTS.md): what each subsystem solves, where the code is, how to verify it, and what it does not handle.
-- [docs/EVALUATION.md](docs/EVALUATION.md): evaluation method, sample composition, known biases and what is still unverified.
+- [docs/DESIGN.md](docs/DESIGN.md)：17 个设计决策，包括模型与存储选型、切片、混合检索、拒答、缓存键、流式协议与 ANN 测量。
+- [docs/TECHNICAL_HIGHLIGHTS.md](docs/TECHNICAL_HIGHLIGHTS.md)：每个子系统解决什么问题、代码在哪、怎么验证、不覆盖什么。
+- [docs/EVALUATION.md](docs/EVALUATION.md)：评测方法、样本组成、已知偏差与尚未验证的结论。
 
-## Limitations
+## 已知限制
 
-- BM25 indexes are built in process memory and rebuilt in full after a knowledge-base change. Large knowledge bases will see a latency spike on the first query after ingestion.
-- The local profile (Chroma + SQLite) has no cross-engine transaction. A failed ingestion is compensated by marking the document `failed`, which can leave a short window where metadata and chunks disagree.
-- Retrieval thresholds and ANN settings are tuned for the corpus in `data/docs`. Different corpora need re-measurement.
-- There is no document-level access control. API keys gate the whole service, not individual knowledge bases.
-- PDF text extraction needs an embedded text layer. Scanned PDFs and PDFs with fonts that lack a ToUnicode map will produce garbled or empty text; the ingestion path reports the failure instead of indexing noise.
-- The rate limiter is an approximate per-second counter in Redis. It is meant to stop obvious abuse, not to enforce precise quotas.
+- BM25 索引在进程内存中，知识库变更后会重新加载；分词结果有缓存，但读取与重建仍是每个知识库 O(N)。超大语料的下一步是数据库侧倒排（tsvector + GIN）。
+- 本地形态（Chroma + SQLite）没有跨引擎事务。摄取失败靠标记 `failed` 补偿，元数据与 chunk 可能短暂不一致。
+- 检索阈值与 ANN 参数按 `data/docs` 的语料调过，换语料需要重新测量。
+- 没有文档级访问控制。API Key 控制整个服务，不能区分知识库。
+- PDF 解析依赖文本层。扫描件或缺少 ToUnicode 映射的字体会得到乱码或空文本，摄取流程会报失败，不会把噪声写进索引。
+- 限流是 Redis 上的近似按秒计数，用于阻挡明显滥用，不能当作精确配额。
 
-## License
+## 许可证
 
 [MIT](LICENSE)

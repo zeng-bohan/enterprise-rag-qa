@@ -82,7 +82,7 @@
 - **为什么只选 Faithfulness + Answer Relevance**：Faithfulness 逐句检验「答案的每个论断能否在检索到的上下文找到依据」，是幻觉的直接度量（幻觉率 = 1 - Faithfulness）；Answer Relevance 检验答案是否切题。两个指标覆盖质量的两面，且都能用 DeepSeek 作 LLM-as-Judge、本地 BGE 作 Embedding，零外部依赖、可复现。
 - **打分口径**：`retrieved_contexts` 用完整 chunk 而非引用 snippet（snippet 只有前 80 字，不足以支撑逐句判定）；抽样 100 条控制成本（`--full` 跑全量）。
 - **样本口径（2026-10 审计补充）**：历史报告用的是 `qa_set[:100]`。QA 集按文件顺序生成，这 100 条全部来自《劳动合同法》，只覆盖 24 个唯一 gold chunk。评审模型与生成模型同为 DeepSeek，自评偏差无法排除。`scripts/eval_ragas.py --sample stratified` 会按来源文档轮流抽样，重跑后才能得到覆盖面更宽的分数。详见 `docs/EVALUATION.md`。
-- **实测结果（100 条抽样）**：Faithfulness 94.1%、Answer Relevance 88.7%、幻觉率 5.9%。
+- **实测结果**：2026-10 分层抽样复测（n=100，覆盖 8 篇文档、25 个唯一 chunk）：Faithfulness 93.27%、Answer Relevance 89.29%、幻觉率 6.73%。历史 head 切片结果（94.1% / 88.7%）保留在 git 历史与上一版报告中，两者样本口径不同，不能直接比较。
 - **工程坑**：
   - ragas 0.4.3 的 collections 指标不兼容 `evaluate()`，直接调 `abatch_score`；它会把输入字典的每个键都作为关键字参数传给 `ascore()`，必须按指标签名裁剪字段，否则报未知参数。
   - 指标内部走异步，客户端必须用 `AsyncOpenAI`（同步客户端 `agenerate` 直接报错）。

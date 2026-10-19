@@ -66,3 +66,19 @@ def test_stratified_sampling_is_deterministic_and_bounded():
     assert first == second
     assert len(first) == 5
     assert len(select_sample(qa_set, 50, "stratified")) == len(qa_set)
+
+
+def test_refusal_summary_reports_both_directions():
+    from scripts.eval_refusal import summarize
+
+    report = summarize(neg_total=20, neg_refused=18, pos_total=50, pos_refused=2)
+    assert report["refusal_rate"] == 0.9
+    assert report["false_refusal_rate"] == 0.04
+
+
+def test_refusal_summary_handles_empty_samples():
+    from scripts.eval_refusal import summarize
+
+    report = summarize(0, 0, 0, 0)
+    assert report["refusal_rate"] is None
+    assert report["false_refusal_rate"] is None

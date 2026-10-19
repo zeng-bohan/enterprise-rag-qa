@@ -41,14 +41,33 @@ def _ragas():
     评测依赖（ragas、openai）单独放在 requirements-eval.txt，不进运行时依赖：
     只想跑离线测试或启动服务的人不该为此多装一套 LLM 评测库。把它放在函数里，
     本模块的纯函数（抽样、样本统计）才能在离线测试里被导入。
+
+    兼容处理：ragas 0.4.3 在导入期会 `from langchain_community.chat_models.vertexai
+    import ChatVertexAI`，而 langchain-community 0.4 已经移除了这个模块。ragas 只把
+    它当作类型引用，不会在本地评测里实例化，因此注入一个占位模块即可，不必为了
+    评测把整个 LangChain 栈降级。
     """
+    import sys
+    import types
+
+    try:
+        import langchain_community.chat_models.vertexai  # noqa: F401
+    except ModuleNotFoundError:
+        stub = types.ModuleType("langchain_community.chat_models.vertexai")
+
+        class ChatVertexAI:  # pragma: no cover - 仅为满足导入期引用
+            pass
+
+        stub.ChatVertexAI = ChatVertexAI
+        sys.modules["langchain_community.chat_models.vertexai"] = stub
+
     from openai import AsyncOpenAI
     from ragas import SingleTurnSample
     from ragas.embeddings import BaseRagasEmbedding
     from ragas.llms import llm_factory
     from ragas.metrics.collections import AnswerRelevancy, Faithfulness
 
-    return SimpleTurnSample, BaseRagasEmbedding, llm_factory, AnswerRelevancy, Faithfulness, AsyncOpenAI
+    return SingleTurnSample, BaseRagasEmbedding, llm_factory, AnswerRelevancy, Faithfulness, AsyncOpenAI
 
 
 def make_ragas_embeddings():
@@ -68,7 +87,7 @@ def make_ragas_embeddings():
     return BGEEmbeddingsRagas()
 
 
-def score(make_metric, samples: list, keys: list[str], batch: int = 20) -> list[float]:
+def score(make_metric, samples: list, keys: list[str], batch: int = 20) -> tuple[list[float], int]:
     """ragas 0.4.3 的 collections 指标不兼容 evaluate()，直接调用其批量打分接口。
 
     注意：abatch_score 会把字典的每个键都作为关键字参数传给 ascore()，
@@ -76,20 +95,30 @@ def score(make_metric, samples: list, keys: list[str], batch: int = 20) -> list[
     指标内部一律走异步调用，客户端需为 AsyncOpenAI。
     按 batch 分批 gather：把 DeepSeek 并发压在每批 20 路以内，避免 429 拖慢评测；
     每个小批次新建 client/llm，避免 AsyncOpenAI 跨事件循环复用报错。
+
+    没有检索到上下文的样本（系统拒答）无法做 Faithfulness 判定，ragas 会直接抛
+    ValueError。这类样本记 0 分并单独返回计数：拒答意味着"没有证据支撑答案"，
+    按 0 计是保守口径，直接从分母里删掉反而会抬高分数。
     """
     _, _, llm_factory, _, _, AsyncOpenAI = _ragas()
     inputs = [{k: getattr(s, k) for k in keys} for s in samples]
-    values: list[float] = []
-    for start in range(0, len(inputs), batch):
+    values = [0.0] * len(inputs)
+    pending = []
+    for i, row in enumerate(inputs):
+        if "retrieved_contexts" in keys and not row.get("retrieved_contexts"):
+            continue
+        pending.append((i, row))
+    for start in range(0, len(pending), batch):
         client = AsyncOpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
         # ragas 默认 max_tokens=1024：Faithfulness 一次输出全部语句判定 JSON，
         # 长答案会被截断抛 IncompleteOutputException；deepseek-chat 输出上限 8192
         llm = llm_factory(settings.deepseek_model, client=client, max_tokens=8192)
-        chunk = inputs[start:start + batch]
-        results = asyncio.run(make_metric(llm).abatch_score(chunk))
-        values.extend(float(getattr(r, "value", 0.0)) for r in results)
-        print(f"  [score] {min(start + batch, len(inputs))}/{len(inputs)}")
-    return values
+        chunk = pending[start:start + batch]
+        results = asyncio.run(make_metric(llm).abatch_score([row for _, row in chunk]))
+        for (index, _), result in zip(chunk, results):
+            values[index] = float(getattr(result, "value", 0.0))
+        print(f"  [score] {min(start + batch, len(pending))}/{len(pending)}")
+    return values, len(inputs) - len(pending)
 
 
 def build_samples(qa_set, pipeline) -> list:
@@ -160,8 +189,8 @@ def main() -> None:
     parser.add_argument(
         "--sample",
         choices=["head", "stratified"],
-        default="head",
-        help="抽样方式：head（历史口径，前 n 条）/ stratified（按文档分层，推荐）",
+        default="stratified",
+        help="抽样方式：stratified（按文档分层，默认）/ head（历史口径，前 n 条）",
     )
     args = parser.parse_args()
 
@@ -180,11 +209,11 @@ def main() -> None:
     _, _, _, AnswerRelevancy, Faithfulness, _AsyncOpenAI = _ragas()
     embeddings = make_ragas_embeddings()
     print("[ragas] 打分中（Faithfulness + AnswerRelevancy）...")
-    faithfulness = score(
+    faithfulness, zero_context = score(
         lambda llm: Faithfulness(llm=llm), samples,
         ["user_input", "response", "retrieved_contexts"],
     )
-    relevancy = score(
+    relevancy, _ = score(
         lambda llm: AnswerRelevancy(llm=llm, embeddings=embeddings), samples,
         ["user_input", "response"],
     )
@@ -204,6 +233,7 @@ def main() -> None:
         "embedding_model": settings.embed_model,
         "sampling": "full" if args.full else args.sample,
         "sample_composition": sample_info,
+        "zero_context_rows": zero_context,
         "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     print("\n===== RAGAs 结果 =====")

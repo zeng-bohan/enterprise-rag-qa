@@ -18,7 +18,7 @@
 
 要解决的问题是：纯向量检索对编号、专有名词这类字面匹配不敏感。项目早期「年假提前几天」的正确 chunk 只排到第二位。
 
-做法是：查询改写只喂 BM25，向量检索用原问题，两路各取 top-20；用 RRF 融合排名，不比较原始分数；融合后的前 8 个候选交给 Cross-Encoder 重排，sigmoid 之后以 0.5 作为相关分界。BM25 按知识库惰性构建。
+做法是：查询改写只喂 BM25，向量检索用原问题，两路各取 top-20；用 RRF 融合排名，不比较原始分数；融合后的前 8 个候选交给 Cross-Encoder 重排，sigmoid 之后以 0.5 作为相关分界。BM25 用带倒排表的实现，查询只遍历包含查询词的 chunk，重建时复用正文分词缓存。BM25 按知识库惰性构建。
 
 代码在：`app/rag/retriever.py`（`rrf_fuse`、`HybridRetriever.aretrieve`）、`app/rag/bm25_index.py`、`app/rag/reranker.py`、`app/rag/query_rewriter.py`
 
@@ -84,7 +84,7 @@
 
 验证方式是：`tests/test_registry.py` 与 `tests/test_retriever.py` 覆盖版本变化触发重建。异步摄取的端到端路径由契约测试在真实 Redis 上验证。
 
-代价是：变更可见性最多延迟一秒。BM25 仍然是全量重建，十万 chunk 级知识库会出现秒级尖刺。真正的增量索引需要把倒排放进 PostgreSQL，当前没有做。
+代价是：变更可见性最多延迟一秒。知识库版本变化后仍要重新拉取该库全部 chunk 重建索引；分词有缓存，读取与建表仍是 O(N)。十万 chunk 级的落点仍是数据库侧倒排（PostgreSQL tsvector + GIN），当前没有做。
 
 ## 8. SSE 流式协议
 

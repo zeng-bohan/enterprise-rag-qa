@@ -29,8 +29,9 @@ python-dotenv>=1.0
 pypdf>=5.0
 
 # 混合检索（v0.2）：中文分词 + BM25 关键词检索
+# BM25 打分由 app/rag/bm25_index.py 的倒排实现完成；rank-bm25 只在
+# 对照测试里当参考实现，因此放在 requirements-dev.txt。
 jieba>=0.42
-rank-bm25>=0.2
 
 # 存储升级（v0.3）：PostgreSQL + pgvector + 连接池 + Redis 缓存
 psycopg[binary,pool]>=3.2

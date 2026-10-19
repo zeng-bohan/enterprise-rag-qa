@@ -1,0 +1,13 @@
+{
+  "negatives": 20,
+  "negatives_refused": 18,
+  "refusal_rate": 0.9,
+  "positives": 50,
+  "positives_refused": 2,
+  "false_refusal_rate": 0.04,
+  "threshold": {
+    "score_threshold": 0.35,
+    "rerank_floor": 0.5
+  },
+  "measured_at": "2026-10-19 16:40:50"
+}

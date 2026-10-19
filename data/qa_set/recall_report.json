@@ -2,6 +2,26 @@
   "mode": "hybrid",
   "n": 334,
   "recall@1": 0.8743,
-  "recall@3": 0.979,
-  "recall@5": 0.982
+  "recall@3": 0.9701,
+  "recall@5": 0.979,
+  "recall@1_chunk_macro": 0.8731,
+  "recall@3_chunk_macro": 0.9694,
+  "recall@5_chunk_macro": 0.9781,
+  "composition": {
+    "rows": 334,
+    "unique_gold_chunks": 80,
+    "unique_questions": 333,
+    "sources": {
+      "中华人民共和国劳动合同法.txt": 113,
+      "中华人民共和国社会保险法.txt": 106,
+      "住房公积金管理条例.txt": 55,
+      "女职工劳动保护特别规定.txt": 24,
+      "员工手册.md": 12,
+      "信息安全管理制度.md": 8,
+      "考勤与请假管理制度.pdf": 8,
+      "财务报销管理制度.md": 8
+    },
+    "rows_per_chunk_mean": 4.17
+  },
+  "measured_at": "2026-10-19 16:31:48"
 }

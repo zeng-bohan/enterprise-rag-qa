@@ -70,3 +70,61 @@ def test_empty_index_returns_no_hits():
 
     index = BM25Index()
     assert index.search("年假", top_k=5) == []
+
+
+def test_scores_match_rank_bm25_reference():
+    """换实现不能改变打分：与 rank_bm25.BM25Okapi 逐文档对比。"""
+    from rank_bm25 import BM25Okapi
+
+    from app.rag.bm25_index import BM25Index
+
+    docs = _FILLERS + [
+        mkdoc("员工请年假须提前三个工作日在 OA 系统申请"),
+        mkdoc("年假天数按工龄计算，未休年假可以顺延一年"),
+        mkdoc("报销流程：提交发票后由直属主管审批"),
+    ]
+    ours = BM25Index(docs)
+    ref = BM25Okapi([BM25Index.tokenize(d.page_content) for d in docs])
+    for query in ("年假", "年假 申请", "报销 发票 审批", "量子计算"):
+        hits = dict((d.page_content, score) for d, score in ours.search(query, top_k=len(docs)))
+        expected = ref.get_scores(BM25Index.tokenize(query))
+        for doc, score in zip(docs, expected):
+            got = hits.get(doc.page_content)
+            if score > 0:
+                assert got is not None and abs(got - float(score)) < 1e-9, (
+                    f"{query!r} / {doc.page_content!r}: ours={got} ref={score}"
+                )
+            else:
+                assert got is None, f"零分或负分文档不应出现在结果里：{doc.page_content!r}"
+
+
+def test_incremental_remove_matches_rebuild():
+    from app.rag.bm25_index import BM25Index
+
+    docs = _FILLERS + [
+        mkdoc("员工请年假须提前三个工作日在 OA 系统申请"),
+        mkdoc("年假天数按工龄计算，未休年假可以顺延一年"),
+    ]
+    incremental = BM25Index(docs)
+    removed = docs[2]
+    assert incremental.remove_by_doc("") == 0  # 没有 doc_id 登记时不误删
+    incremental.remove_documents([incremental._key_for(removed)])  # noqa: SLF001
+    fresh = BM25Index([d for d in docs if d is not removed])
+    for query in ("年假", "打卡", "报销"):
+        assert [d.page_content for d, _ in incremental.search(query, 10)] == [
+            d.page_content for d, _ in fresh.search(query, 10)
+        ]
+
+
+def test_incremental_add_matches_rebuild():
+    from app.rag.bm25_index import BM25Index
+
+    base = _FILLERS[:3]
+    added = [_FILLERS[3], mkdoc("年假制度：年假申请与天数说明")]
+    incremental = BM25Index(base)
+    incremental.add_documents(added)
+    fresh = BM25Index(base + added)
+    for query in ("年假", "住宿", "会议室"):
+        assert [d.page_content for d, _ in incremental.search(query, 10)] == [
+            d.page_content for d, _ in fresh.search(query, 10)
+        ]

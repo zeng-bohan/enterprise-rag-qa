@@ -156,3 +156,41 @@ def test_degraded_reranker_keeps_results_instead_of_empty(monkeypatch):
     )
     assert [d.page_content for d, _ in out] == ["文档0", "文档1", "文档2"]  # RRF 序保留
     assert r._reranker.available is False
+
+
+# ---------------------------------------------------------------------------
+# 默认知识库解析：名称与 ID 不能混用
+# ---------------------------------------------------------------------------
+def test_default_kb_name_resolves_to_registry_id():
+    """chunk 里存的是注册中心分配的 ID，默认配置给的是名称。
+
+    以前检索层直接拿名称当 kb_id 过滤，脚本和未带 kb_id 的请求查不到任何 chunk，
+    表现是全量拒答。这里锁定解析结果，并确认解析只发生一次。
+    """
+    from app.config import settings
+
+    calls = []
+
+    def resolver():
+        calls.append(settings.default_kb)
+        return "kb-id-123"
+
+    r = object.__new__(HybridRetriever)
+    r._default_kb_id = None
+    r._default_kb_resolver = resolver
+
+    assert r._resolve_default_kb() == "kb-id-123"
+    assert r._resolve_default_kb() == "kb-id-123"
+    assert calls == [settings.default_kb], "默认库 ID 解析应缓存，只查一次注册中心"
+
+
+def test_default_kb_falls_back_to_name_when_resolver_fails():
+    from app.config import settings
+
+    def boom():
+        raise RuntimeError("registry down")
+
+    r = object.__new__(HybridRetriever)
+    r._default_kb_id = None
+    r._default_kb_resolver = boom
+    assert r._resolve_default_kb() == settings.default_kb

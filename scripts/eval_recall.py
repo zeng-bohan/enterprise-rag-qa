@@ -22,11 +22,12 @@ from typing import Dict, List, Optional, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.rag.retriever import HybridRetriever
-from app.rag.vector_store import _doc_id, get_store
+from app.rag.pipeline import RAGPipeline
+from app.rag.vector_store import _doc_id
 
 QA_PATH = ROOT / "data" / "qa_set" / "qa_300.json"
 REPORT = ROOT / "data" / "qa_set" / "recall_report.json"
+BASELINE_REPORT = ROOT / "data" / "qa_set" / "recall_report_baseline.json"
 K_VALUES = (1, 3, 5)
 
 
@@ -86,23 +87,23 @@ def main():
     qa_set = json.loads(QA_PATH.read_text(encoding="utf-8"))
     print(f"[eval] 评测集 {len(qa_set)} 行，{len({q['chunk_id'] for q in qa_set})} 个唯一 gold chunk，top-k = 5")
 
-    store = get_store()
+    pipeline = RAGPipeline()
     if args.baseline:
         print("[eval] 模式：纯向量基线（v0.1 形态）")
-        metrics = run(qa_set, store.search, "baseline")
+        metrics = run(qa_set, pipeline.store.search, "baseline")
         result = {"mode": "baseline", "n": len(qa_set), **metrics}
     else:
         print("[eval] 模式：混合检索（改写+BM25+向量+RRF+重排）")
-        retriever = HybridRetriever(store)
-        metrics = run(qa_set, retriever.retrieve, "hybrid")
+        metrics = run(qa_set, pipeline.retriever.retrieve, "hybrid")
         result = {"mode": "hybrid", "n": len(qa_set), **metrics}
 
     result["measured_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     print("\n===== 结果 =====")
     for k_, v in result.items():
         print(f"  {k_}: {v}")
-    REPORT.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[eval] 报告已存：{REPORT}")
+    target = BASELINE_REPORT if args.baseline else REPORT
+    target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[eval] 报告已存：{target}")
 
 
 if __name__ == "__main__":

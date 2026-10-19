@@ -73,10 +73,10 @@ def main() -> None:
         try:
             record = ingest_file(pipe, kb_id, f)
         except Exception as exc:
-            print(f"[ingest] ✗ {f.name}: {exc}")
+            print(f"[ingest] FAIL {f.name}: {exc}")
             continue
         total_chunks += record["chunk_count"]
-        print(f"[ingest] ✓ {f.name}: {record['chunk_count']} chunks (doc_id={record['doc_id'][:8]}…)")
+        print(f"[ingest] OK   {f.name}: {record['chunk_count']} chunks (doc_id={record['doc_id'][:8]}...)")
     pipe.retriever.invalidate(kb_id)
     print(
         f"[ingest] 完成：知识库「{kb_name}」共 {total_chunks} chunks，"
